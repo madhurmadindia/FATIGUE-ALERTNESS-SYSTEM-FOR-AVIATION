@@ -1,0 +1,485 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AeroVigil — Pilot Fatigue & Alertness Evaluator</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;600;700&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+</head>
+<body>
+
+  <!-- ── FLIGHT DECK HEADER ──────────────────────────────────────────────── -->
+  <header>
+    <div class="header-left">
+      <div class="logo-badge">
+        <svg class="plane-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17.8 19.2 16 11l3.5-3.5C21 6 21.5 4 21 3c-1-.5-3 0-4.5 1.5L13 8 4.8 6.2c-.5-.1-.9.1-1.1.5l-.3.5c-.2.5-.1 1 .3 1.3L9 12l-2 3H4l-1 1 3 2 2 3 1-1v-3l3-2 3.5 5.2c.3.4.8.5 1.3.3l.5-.3c.4-.2.6-.6.5-1.1z"/>
+        </svg>
+      </div>
+      <div class="logo-text">
+        <div class="logo-title-row">
+          <span class="logo-main">AEROVIGIL</span>
+          <span class="logo-tag">FLIGHT OPS</span>
+        </div>
+        <span class="logo-sub">Pre-Flight Fatigue &amp; Alertness Telemetry</span>
+      </div>
+    </div>
+
+    <div class="header-center">
+      <div id="status-pill" class="pill idle">
+        <span class="status-indicator-dot"></span>
+        <span id="status-text">AWAITING EVALUATION</span>
+      </div>
+    </div>
+
+    <div class="header-right">
+      <div class="header-card">
+        <span class="meta-label">UTC / ZULU</span>
+        <span id="utc-clock" class="meta-value mono">--:--:--Z</span>
+      </div>
+      <div class="header-card">
+        <span class="meta-label">LOCAL TIME</span>
+        <span id="clock" class="meta-value mono">--:--:--</span>
+      </div>
+      <div class="header-card highlight">
+        <span class="meta-label">SESSION</span>
+        <span id="session-time" class="meta-value mono">00:00</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── MAIN DASHBOARD ──────────────────────────────────────────────────── -->
+  <main>
+
+    <!-- LEFT COLUMN: CAMERA & HUD -->
+    <section class="left-col">
+
+      <!-- Camera HUD Panel -->
+      <div class="panel video-panel">
+        <div class="panel-title">
+          <div class="title-with-icon">
+            <span class="panel-icon-dot"></span>
+            <span>OPTICAL HUD · FACE TELEMETRY</span>
+          </div>
+          <div class="hud-meta-tags">
+            <span class="hud-chip">AI TRACKER</span>
+            <span id="fps-badge" class="badge mono">-- FPS</span>
+          </div>
+        </div>
+
+        <div class="video-wrapper">
+          <video id="webcam" autoplay playsinline muted></video>
+          <canvas id="output_canvas"></canvas>
+
+          <!-- Reticle & HUD Overlays -->
+          <div class="hud-overlay">
+            <div class="hud-crosshair"></div>
+            <div class="hud-header-info">
+              <span>TARGET LOCK: <b id="hud-target-status">SEARCHING</b></span>
+              <span class="hud-res">640×480 · 30FPS</span>
+            </div>
+            <div class="hud-horizon-bar"></div>
+          </div>
+
+          <!-- Corner brackets -->
+          <div class="corner tl"></div>
+          <div class="corner tr"></div>
+          <div class="corner bl"></div>
+          <div class="corner br"></div>
+
+          <!-- Laser Scan Line -->
+          <div id="scan-line" class="scan-line hidden"></div>
+
+          <!-- No Face Alert -->
+          <div id="no-face-overlay" class="no-face-overlay hidden">
+            <div class="nf-inner">
+              <div class="nf-icon-wrap">
+                <svg viewBox="0 0 24 24" width="36" height="36" fill="none" stroke="currentColor" stroke-width="2">
+                  <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+                  <circle cx="12" cy="12" r="3"/>
+                  <line x1="2" y1="2" x2="22" y2="22" stroke="currentColor" stroke-width="2"/>
+                </svg>
+              </div>
+              <span class="nf-title">NO PILOT FACE DETECTED</span>
+              <span class="nf-desc">Align within camera field of view</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- High-Precision Metric Cards -->
+        <div class="metric-strip">
+          <div class="metric-cell" id="card-lear">
+            <div class="mc-header">
+              <span class="mc-label">L-EAR</span>
+              <span class="mc-chip">LEFT</span>
+            </div>
+            <div class="mc-value mono" id="left-ear-val">---</div>
+            <div class="mc-status" id="st-lear">Calibrating</div>
+          </div>
+
+          <div class="metric-cell" id="card-rear">
+            <div class="mc-header">
+              <span class="mc-label">R-EAR</span>
+              <span class="mc-chip">RIGHT</span>
+            </div>
+            <div class="mc-value mono" id="right-ear-val">---</div>
+            <div class="mc-status" id="st-rear">Calibrating</div>
+          </div>
+
+          <div class="metric-cell" id="card-mar">
+            <div class="mc-header">
+              <span class="mc-label">MAR</span>
+              <span class="mc-chip">MOUTH</span>
+            </div>
+            <div class="mc-value mono" id="mar-val">---</div>
+            <div class="mc-status" id="st-mar">Neutral</div>
+          </div>
+
+          <div class="metric-cell" id="card-perclos">
+            <div class="mc-header">
+              <span class="mc-label">PERCLOS</span>
+              <span class="mc-chip">WINDOW</span>
+            </div>
+            <div class="mc-value mono" id="perclos-val">---</div>
+            <div class="mc-status" id="st-perclos">Optimal</div>
+          </div>
+
+          <div class="metric-cell" id="card-posture">
+            <div class="mc-header">
+              <span class="mc-label">POSTURE</span>
+              <span class="mc-chip" id="posture-chip">3D FUSION</span>
+            </div>
+            <div class="mc-value mono" id="posture-val">---</div>
+            <div class="mc-status" id="st-posture">Upright</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Controls & Cockpit Annunciators -->
+      <div class="panel controls-panel">
+        <div class="panel-title">
+          <div class="title-with-icon">
+            <span class="panel-icon-dot"></span>
+            <span>FLIGHT DECK CONTROLS &amp; SENSORS</span>
+          </div>
+        </div>
+
+        <div class="controls-body">
+          <div class="primary-action-wrap">
+            <button id="btn-start" class="btn btn-primary btn-large" disabled>
+              <svg class="btn-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <polygon points="5 3 19 12 5 21 5 3"/>
+              </svg>
+              <span>BEGIN EVALUATION</span>
+            </button>
+          </div>
+
+          <div class="controls-secondary">
+            <button id="btn-reset" class="btn btn-ghost">
+              <svg class="btn-svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/>
+                <path d="M3 3v5h5"/>
+              </svg>
+              <span>Reset Session</span>
+            </button>
+
+            <button id="btn-export" class="btn btn-ghost">
+              <svg class="btn-svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                <polyline points="7 10 12 15 17 10"/>
+                <line x1="12" y1="15" x2="12" y2="3"/>
+              </svg>
+              <span>Export Telemetry</span>
+            </button>
+          </div>
+
+          <!-- Avionics Annunciator Panel -->
+          <div class="annunciator-box">
+            <span class="annunciator-label">LIVE BIOMETRIC CHANNELS</span>
+            <div class="posture-row">
+              <div class="posture-cell" id="ind-left-eye">
+                <div class="ind-dot"></div>
+                <div class="ind-text-col">
+                  <span class="ind-title">LEFT EYE</span>
+                  <span class="ind-state">NORMAL</span>
+                </div>
+              </div>
+
+              <div class="posture-cell" id="ind-right-eye">
+                <div class="ind-dot"></div>
+                <div class="ind-text-col">
+                  <span class="ind-title">RIGHT EYE</span>
+                  <span class="ind-state">NORMAL</span>
+                </div>
+              </div>
+
+              <div class="posture-cell" id="ind-mouth">
+                <div class="ind-dot"></div>
+                <div class="ind-text-col">
+                  <span class="ind-title">MOUTH</span>
+                  <span class="ind-state">CLOSED</span>
+                </div>
+              </div>
+
+              <div class="posture-cell" id="ind-head-pose">
+                <div class="ind-dot"></div>
+                <div class="ind-text-col">
+                  <span class="ind-title">HEAD POSE</span>
+                  <span class="ind-state">LEVEL</span>
+                </div>
+              </div>
+
+              <div class="posture-cell" id="ind-torso">
+                <div class="ind-dot"></div>
+                <div class="ind-text-col">
+                  <span class="ind-title">TORSO/SPINE</span>
+                  <span class="ind-state">UPRIGHT</span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+    </section>
+
+    <!-- RIGHT COLUMN: SCORE, CHART & FLIGHT LOG -->
+    <section class="right-col">
+
+      <!-- Pilot Alertness Gauge & Summary -->
+      <div class="panel score-panel">
+        <div class="panel-title">
+          <div class="title-with-icon">
+            <span class="panel-icon-dot"></span>
+            <span>PILOT ALERTNESS SCORE</span>
+          </div>
+          <span class="hud-chip highlight">SAFETY CRITICAL</span>
+        </div>
+
+        <div class="score-body">
+          <div class="gauge-card">
+            <canvas id="gaugeCanvas" width="220" height="130"></canvas>
+            <div class="gauge-center-val">
+              <span id="score-number" class="score-num mono">--</span>
+              <span class="score-percent">%</span>
+            </div>
+          </div>
+
+          <div class="score-info">
+            <div class="score-verdict-wrap">
+              <div class="score-verdict-title">READINESS STATUS</div>
+              <div id="score-label" class="score-lbl">AWAITING START</div>
+            </div>
+
+            <!-- Graduated Scale Spectrum -->
+            <div class="safety-spectrum">
+              <div class="spec-seg red" title="0-25 Critical Grounding"></div>
+              <div class="spec-seg amber" title="25-45 High Fatigue"></div>
+              <div class="spec-seg yellow" title="45-75 Moderate Attention"></div>
+              <div class="spec-seg green" title="75-100 Cleared to Fly"></div>
+            </div>
+            <div class="spectrum-labels">
+              <span>UNFIT &le;25</span>
+              <span>CAUTION 45</span>
+              <span>CLEARED &ge;75</span>
+            </div>
+
+            <div class="score-divider"></div>
+
+            <div class="score-breakdown">
+              <div class="sb-chip">
+                <span class="sb-k">EVENTS</span>
+                <b id="event-count" class="mono">0</b>
+              </div>
+              <div class="sb-chip">
+                <span class="sb-k">LONG BLINKS</span>
+                <b id="longblink-count-r" class="mono">0</b>
+              </div>
+              <div class="sb-chip">
+                <span class="sb-k">YAWNS</span>
+                <b id="yawn-count-r" class="mono">0</b>
+              </div>
+              <div class="sb-chip">
+                <span class="sb-k">POSTURE DROPS</span>
+                <b id="headdrop-count-r" class="mono">0</b>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div id="alert-banner" class="alert-banner hidden">
+          <div class="alert-icon">⚠</div>
+          <div class="alert-text">
+            <b>CRITICAL FLIGHT DECK ALERT:</b> PILOT EXCEEDED FATIGUE SAFETY LIMITS · IMMEDIATE REPLACEMENT MANDATED
+          </div>
+        </div>
+      </div>
+
+      <!-- Real-Time Biometrics Telemetry Chart -->
+      <div class="panel chart-panel">
+        <div class="panel-title">
+          <div class="title-with-icon">
+            <span class="panel-icon-dot"></span>
+            <span>BIOMETRIC FLIGHT TELEMETRY (ROLLING 60s)</span>
+          </div>
+          <div class="chart-legend">
+            <span class="leg-pill"><span class="leg-dot" style="background:#0284C7"></span>L-EAR</span>
+            <span class="leg-pill"><span class="leg-dot" style="background:#0EA5E9"></span>R-EAR</span>
+            <span class="leg-pill"><span class="leg-dot" style="background:#D97706"></span>MAR</span>
+            <span class="leg-pill highlight"><span class="leg-dot" style="background:#059669"></span>Score</span>
+          </div>
+        </div>
+        <div class="chart-wrap">
+          <canvas id="telemetryChart"></canvas>
+        </div>
+      </div>
+
+      <!-- Flight Deck Event Log (ACARS Style) -->
+      <div class="panel log-panel">
+        <div class="panel-title">
+          <div class="title-with-icon">
+            <span class="panel-icon-dot"></span>
+            <span>OPERATIONAL EVENT LOG</span>
+          </div>
+          <span id="event-count-badge" class="badge">0 events recorded</span>
+        </div>
+        <div class="log-container">
+          <ul id="event-log">
+            <li class="log-empty">
+              <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.5">
+                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                <polyline points="14 2 14 8 20 8"/>
+                <line x1="16" y1="13" x2="8" y2="13"/>
+                <line x1="16" y1="17" x2="8" y2="17"/>
+              </svg>
+              <span>Awaiting session initiation. Events will be recorded in real-time.</span>
+            </li>
+          </ul>
+        </div>
+      </div>
+
+    </section>
+  </main>
+
+  <!-- ── LOADING OVERLAY ─────────────────────────────────────────────────── -->
+  <div id="loading-overlay" class="modal-backdrop">
+    <div class="modal">
+      <div class="modal-badge">
+        <span class="loader-plane">✈</span>
+      </div>
+      <h2>AEROVIGIL SYSTEM BOOT</h2>
+      <div class="loader-ring"></div>
+      <p id="loading-msg">Initialising optical vision subsystem &amp; camera hardware…</p>
+      <span class="modal-foot-note">Compliant with FAA &amp; ICAO Fatigue Risk Management Systems (FRMS)</span>
+    </div>
+  </div>
+
+  <!-- ── CALIBRATION INSTRUCTIONS MODAL ─────────────────────────────────── -->
+  <div id="calibration-modal" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-badge-info">
+        <svg viewBox="0 0 24 24" width="28" height="28" fill="none" stroke="currentColor" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="12" y1="16" x2="12" y2="12"/>
+          <line x1="12" y1="8" x2="12.01" y2="8"/>
+        </svg>
+      </div>
+      <h2>PRE-FLIGHT BIOMETRIC CALIBRATION</h2>
+      <p>A quick <strong>10-second baseline capture</strong> is required to calibrate your individual Eye Aspect Ratio (EAR), Mouth Aspect Ratio (MAR), and posture baseline.</p>
+
+      <div class="checklist">
+        <div class="chk-item">
+          <span class="chk-icon">✔</span>
+          <div class="chk-content">
+            <b>Optimal Lighting:</b> Ensure face is evenly illuminated with no direct backlight.
+          </div>
+        </div>
+        <div class="chk-item">
+          <span class="chk-icon">✔</span>
+          <div class="chk-content">
+            <b>Cockpit Seating Posture:</b> Face camera directly with shoulders relaxed and visible.
+          </div>
+        </div>
+        <div class="chk-item">
+          <span class="chk-icon">✔</span>
+          <div class="chk-content">
+            <b>Neutral Expression:</b> Relax facial muscles during the 10-second calibration window.
+          </div>
+        </div>
+      </div>
+
+      <button id="btn-begin-calibration" class="btn btn-primary btn-large">
+        <span>BEGIN 10s CALIBRATION</span>
+        <svg class="btn-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+          <line x1="5" y1="12" x2="19" y2="12"/>
+          <polyline points="12 5 19 12 12 19"/>
+        </svg>
+      </button>
+    </div>
+  </div>
+
+  <!-- ── CALIBRATION RUNNING MODAL ───────────────────────────────────────── -->
+  <div id="calibration-progress" class="modal-backdrop hidden">
+    <div class="modal">
+      <div class="modal-pulse-badge">
+        <span class="live-pulse-radar"></span>
+      </div>
+      <h2>CALIBRATING BIOMETRICS…</h2>
+      <p>Maintain standard seated posture. Look straight ahead into the camera.</p>
+
+      <div class="countdown-circle">
+        <div id="calib-countdown" class="calib-num mono">10</div>
+        <span class="calib-unit">SECONDS</span>
+      </div>
+
+      <div class="prog-track">
+        <div id="calib-bar" class="prog-fill"></div>
+      </div>
+
+      <p class="calib-hint">Computing median EAR, MAR, 3D Euler angles, and spinal alignment vectors…</p>
+    </div>
+  </div>
+
+  <!-- ── EVALUATION RESULT MODAL (FLIGHT CREW CLEARANCE) ─────────────────── -->
+  <div id="result-modal" class="modal-backdrop hidden">
+    <div class="modal result-modal-card">
+      <div class="cert-header">
+        <span class="cert-airline">FLIGHT OPERATIONS DISPATCH</span>
+        <span class="cert-doc">CREW FITNESS EVALUATION REPORT</span>
+      </div>
+
+      <div class="result-score-wrap">
+        <div id="result-score-display" class="result-score mono">--</div>
+        <div class="result-score-sub">ALERTNESS INDEX (0 - 100)</div>
+      </div>
+
+      <div id="result-verdict" class="result-verdict">--</div>
+      <div id="result-details" class="result-details"></div>
+
+      <div class="result-actions">
+        <button id="btn-result-export" class="btn btn-ghost">
+          <svg class="btn-svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+            <polyline points="7 10 12 15 17 10"/>
+            <line x1="12" y1="15" x2="12" y2="3"/>
+          </svg>
+          <span>Download Telemetry JSON</span>
+        </button>
+        <button id="btn-result-restart" class="btn btn-primary">
+          <svg class="btn-svg-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="1 4 1 10 7 10"/>
+            <path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/>
+          </svg>
+          <span>New Pilot Assessment</span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="/static/app.js"></script>
+</body>
+</html>
