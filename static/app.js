@@ -1,1517 +1,804 @@
 /**
- * AeroVigil — Pilot Fatigue Evaluator (app.js)
- * High-Precision Biometrics & Enhanced 3D Postural Flight-Deck Monitor
+ * AeroVigil Pre-Flight Check — flow controller.
  *
- * Capabilities:
- *  1. PER-EYE INDIVIDUALIZED EAR: Independent per-eye tracking with normalized
- *     baseline ratios to catch unilateral ocular fatigue (one-eye droop).
- *  2. DUAL-TIER POSTURE FUSION ENGINE:
- *     - 3D Facial Euler Angles: Pitch (forward nodding in degrees), Yaw (inattention /
- *       looking away from cockpit instruments), Roll (lateral ear-to-shoulder tilt),
- *       and Z-depth translation (slumping back into seat).
- *     - MediaPipe Upper-Body Pose Landmarker: Tracks shoulders (11 & 12) for shoulder droop
- *       and chin-to-clavicle vertical distance for spinal slouching / hunched back.
- *     - Graceful Fallback: If shoulders are out of frame, the system runs in
- *       High-Precision 3D Face Mode with zero interruptions.
- *  3. COCKPIT HUD SKELETON: Renders illuminated sky-blue shoulder line, spinal axis,
- *     and diamond tactical reticles on the live video feed.
- *  4. AUTO-GROUND INTERLOCK: Immediate grounding when score drops to ≤ 25.
- *  5. AMORTIZED 60s TIME-WINDOWED PERCLOS: Physiologically tuned for flight crew safety.
+ * Eight screens, two timed blocks, one verdict against the pilot's own baseline.
+ * The verdict comes from measured performance; the camera supplies supporting
+ * signals and data quality only. See reports/mentor for the rationale.
  */
 
-const MP_VERSION = "0.10.3";
-const MP_CDN     = `https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@${MP_VERSION}`;
+import { Vision, REST_SIGN } from "./vision.js";
+import {
+  blockStats, qualityFromSignals, dataQuality, compareToBaseline, decideVerdict,
+  selfReportMismatch, drowsinessScore,
+  TOUCH_LAPSE_MS, FALSE_START_MS, GESTURE_TIMEOUT_MS,
+  BASELINE_TARGET, FAMILIARISATION, VERDICT,
+} from "./metrics.js";
 
-// ── Landmark Indices ──────────────────────────────────────────────────────────
-// Face Landmarks
-const LEFT_EYE     = [362, 263, 385, 387, 380, 373];
-const RIGHT_EYE    = [33,  133, 160, 158, 144, 153];
-const MOUTH        = [61, 291, 13, 14];
-const FOREHEAD     = 10;
-const CHIN         = 152;
-const LEFT_EAR_PT  = 234;
-const RIGHT_EAR_PT = 454;
-const NOSE_TIP     = 1;
-// Additional anchor points for robust posture geometry
-const NOSE_BRIDGE  = 6;    // Bridge of nose (stable Z reference)
-const L_CHEEK      = 116;  // Left cheek lateral point
-const R_CHEEK      = 345;  // Right cheek lateral point
+// ── Block parameters ─────────────────────────────────────────────────────────
+const TOUCH_MS = 60_000;          // touch block length
+const TOUCH_ISI = [1000, 4000];   // PVT-B style inter-stimulus interval
+const TOUCH_TIMEOUT_MS = 3000;
+const GESTURE_TRIALS = 20;
+const GESTURE_ISI = [900, 2500];  // measured from the moment the fist is settled
+const PRACTICE_TRIALS = 5;
+const STABLE_FRAMES = 3;          // frames a sign must hold before it counts
 
-// Pose Landmarks (MediaPipe Pose)
-const POSE_NOSE            = 0;
-const POSE_LEFT_SHOULDER   = 11;
-const POSE_RIGHT_SHOULDER  = 12;
+const SHAPE_DEFS = [
+  { id: 1, name: "Triangle", colour: "#EA580C" },
+  { id: 2, name: "Circle",   colour: "#0284C7" },
+  { id: 3, name: "Square",   colour: "#059669" },
+  { id: 4, name: "Diamond",  colour: "#CA8A04" },
+  { id: 5, name: "Star",     colour: "#7C3AED" },
+];
 
-// ── Scoring Constants & Thresholds ────────────────────────────────────────────
-const EAR_CLOSED_RATIO         = 0.70;   // Eye closed when EAR < baseline × 0.70 (30% vertical drop)
-const MAR_YAWN_RATIO           = 2.2;    // Yawn flagged when mouth opens > 2.2× resting baseline
-const EAR_ASYM_THRESH          = 0.32;   // Asymmetry triggered when one eye drops >32% more than the other
-const LONG_BLINK_MS            = 1500;   // 1500ms continuous closure = stage-1 micro-sleep
-const YAWN_MIN_MS              = 1800;   // 1800ms sustained mouth opening = true yawn (filters speech)
+function shuffleShapes() {
+  const nums = [1, 2, 3, 4, 5];
+  for (let i = nums.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [nums[i], nums[j]] = [nums[j], nums[i]];
+  }
+  return SHAPE_DEFS.map((s, i) => ({ ...s, n: nums[i] }));
+}
 
-// ── Posture Thresholds (Robust 2D/3D Cockpit Telemetry) ──────────────────────
-// HEAD PITCH: Percentage drop in face height-to-width ratio from calibrated upright baseline.
-// When head nods forward (chin drops toward chest), face height foreshortens.
-// A 7.0% drop corresponds to a clear, realistic forward nodding event (~14-18° pitch).
-const HEAD_PITCH_DROP_PCT      = 7.0;    // > 7.0% vertical foreshortening from baseline
-
-// HEAD YAW: Derived from 2D ocular-nasal horizontal symmetry in screen coordinates.
-// When head turns sideways, nose tip shifts away from the eye midpoint.
-// Unaffected by depth noise; highly robust across all lighting and webcams.
-const HEAD_YAW_DEG_THRESH      = 17.0;   // > 17° azimuth turn away from straight ahead
-const HEAD_YAW_MS              = 2800;   // Sustained 2.8s before inattention penalty
-
-// HEAD ROLL: Angular tilt (degrees) between outer eye corners (pt 362 vs pt 33).
-const HEAD_TILT_DEG            = 8.5;    // > 8.5° lateral ear-to-shoulder roll from baseline
-
-// HEAD PERSIST: Continuous head nod or slump duration before penalty registers.
-const HEAD_PERSIST_MS          = 500;    // 500ms debounce — filters momentary blips
-
-// TORSO / SPINAL POSTURE:
-// 1. Upper-body pose active:
-const SPINE_SLOUCH_RATIO_DROP  = 0.18;   // 18% drop in chin-to-clavicle clearance = torso slouch
-const SHOULDER_TILT_DEG        = 8.0;    // > 8.0° shoulder height listing from baseline
-// 2. Camera cropped to face (no shoulders visible):
-// Tracks vertical sink of nose position in frame + depth scale
-const SINK_SLOUCH_DROP         = 0.16;   // Face sinks down in camera frame by >16% of face height
-const Z_SLOUCH_DROP            = 0.16;   // 16% face width shrinkage
-
-const TORSO_PERSIST_MS         = 900;    // 900ms sustained slouch before penalty
-
-const REGEN_PER_SEC            = 2.5;    // Frame-rate independent: +2.5 score points/sec when alert
-const AUTO_GROUND_SCORE        = 25;     // Automatic flight grounding threshold
-
-// Fatigue Penalties & Debounce Cooldowns (milliseconds)
-const PENALTY  = {
-  longBlink: 30,
-  yawn:      15,
-  headDrop:  22,
-  asymmetry: 18,
-  slouch:    18,
-  yawDrift:  12
+const STEPS = ["welcome", "checkin", "setup", "practice", "touch", "gesture", "analysing", "result"];
+const STEP_LABELS = {
+  welcome: "Welcome", checkin: "Check-in", setup: "Setup", practice: "Practice",
+  touch: "Touch test", gesture: "Hand-sign test", analysing: "Analysing", result: "Result",
 };
 
-const COOLDOWN = {
-  longBlink: 3000,
-  yawn:      5000,
-  headDrop:  3500,
-  asymmetry: 5000,
-  slouch:    4500,
-  yawDrift:  5500
-};
+const STORE_KEY = "aerovigil.v1";
+const $ = (sel) => document.querySelector(sel);
+const rand = (min, max) => min + Math.random() * (max - min);
 
-// ── DOM References ────────────────────────────────────────────────────────────
-const video           = document.getElementById("webcam");
-const canvas          = document.getElementById("output_canvas");
-const ctx2d           = canvas.getContext("2d");
-const noFaceOverlay   = document.getElementById("no-face-overlay");
-const scanLine        = document.getElementById("scan-line");
-const hudTargetStatus = document.getElementById("hud-target-status");
+// ── Stored sessions (this device only) ───────────────────────────────────────
 
-const leftEarVal      = document.getElementById("left-ear-val");
-const rightEarVal     = document.getElementById("right-ear-val");
-const marVal          = document.getElementById("mar-val");
-const perclosVal      = document.getElementById("perclos-val");
-const postureVal      = document.getElementById("posture-val");
-const fpsBadge        = document.getElementById("fps-badge");
-
-const stLear          = document.getElementById("st-lear");
-const stRear          = document.getElementById("st-rear");
-const stMar           = document.getElementById("st-mar");
-const stPerclos       = document.getElementById("st-perclos");
-const stPosture       = document.getElementById("st-posture");
-
-const scoreNumber     = document.getElementById("score-number");
-const scoreLabel      = document.getElementById("score-label");
-const alertBanner     = document.getElementById("alert-banner");
-const statusPill      = document.getElementById("status-pill");
-const statusText      = document.getElementById("status-text");
-const gaugeCanvas     = document.getElementById("gaugeCanvas");
-const gaugeCtx        = gaugeCanvas.getContext("2d");
-
-const eventLog        = document.getElementById("event-log");
-const eventCount      = document.getElementById("event-count");
-const eventCountBadge = document.getElementById("event-count-badge");
-const longBlinkCountR = document.getElementById("longblink-count-r");
-const yawnCountR      = document.getElementById("yawn-count-r");
-const headDropCountR  = document.getElementById("headdrop-count-r");
-const sessionTimeEl   = document.getElementById("session-time");
-const clockEl         = document.getElementById("clock");
-const utcClockEl      = document.getElementById("utc-clock");
-
-const btnStart        = document.getElementById("btn-start");
-const btnReset        = document.getElementById("btn-reset");
-const btnExport       = document.getElementById("btn-export");
-const loadingOverlay  = document.getElementById("loading-overlay");
-const loadingMsg      = document.getElementById("loading-msg");
-const calibModal      = document.getElementById("calibration-modal");
-const calibProgress   = document.getElementById("calibration-progress");
-const calibBar        = document.getElementById("calib-bar");
-const calibCountdown  = document.getElementById("calib-countdown");
-const btnBeginCalib   = document.getElementById("btn-begin-calibration");
-const resultModal     = document.getElementById("result-modal");
-const resultScore     = document.getElementById("result-score-display");
-const resultVerdict   = document.getElementById("result-verdict");
-const resultDetails   = document.getElementById("result-details");
-const btnResultExport = document.getElementById("btn-result-export");
-const btnResultRestart= document.getElementById("btn-result-restart");
-
-// Cockpit Annunciator cells
-const indLeftEye      = document.getElementById("ind-left-eye");
-const indRightEye     = document.getElementById("ind-right-eye");
-const indMouth        = document.getElementById("ind-mouth");
-const indHeadPose     = document.getElementById("ind-head-pose") || document.getElementById("ind-posture");
-const indTorso        = document.getElementById("ind-torso");
-
-// ── State Variables ───────────────────────────────────────────────────────────
-let faceLandmarker        = null;
-let poseLandmarker        = null;
-let poseLandmarkerReady   = false;
-let sessionActive         = false;
-let sessionEnding         = false;
-let systemReady           = false;
-let lastVideoTime         = -1;
-let alertnessScore        = 100;
-
-// Calibrated Baselines
-let baselineLeftEAR       = 0.28;
-let baselineRightEAR      = 0.28;
-let baselineEAR           = 0.28;
-let baselineMAR           = 0.12;
-let baselinePitchRatio    = 1.15;   // Face height/width ratio upright (primary nod signal)
-let baselineYawDeg        = 0.0;    // 2D horizontal gaze angle at straight-ahead (degrees)
-let baselineTilt          = 0.0;    // Lateral roll angle at upright (degrees)
-let baselineNoseY         = 0.45;   // Vertical nose position in frame (seat sink detection)
-let baselineFaceWidth     = 140.0;  // Pixel face width at calibration distance
-let baselineShoulderTilt  = 0.0;    // Signed shoulder angle at upright (degrees)
-let baselineSpineRatio    = null;   // Chin-to-clavicle / shoulder-span ratio at upright
-let hasUpperBodyBaseline  = false;
-
-let isCalibrating         = false;
-let calibFrames           = [];
-
-// Signal Smoothing (Exponential Moving Average)
-let smoothL_EAR           = null;
-let smoothR_EAR           = null;
-let smoothMAR             = null;
-// Posture signal smoothing — separate EMA for each angle channel
-let smoothPitchRatio      = null;
-let smoothYawDeg          = null;
-let smoothTiltDeg         = null;
-let smoothNoseY           = null;
-let smoothSpineRatio      = null;
-let smoothShoulderTilt    = null;
-const EMA_ALPHA           = 0.75;   // EAR / MAR: fast biometric signals
-const EMA_POSTURE_ALPHA   = 0.60;   // Posture: 60% instant frame, 40% memory — smooth & responsive!
-
-// Timing & Frame-rate Independence
-let lastScoreUpdateTime   = performance.now();
-
-// Eye State Tracking
-let isBlinking            = false;
-let blinkStartTime        = 0;
-let longBlinkFired        = false;
-let leftEyeClosed         = false;
-let rightEyeClosed        = false;
-
-// Yawn Tracking
-let isYawning             = false;
-let yawnStartTime         = 0;
-let yawnFired             = false;
-
-// Asymmetry Tracking (One-eye droop)
-let asymFired             = false;
-let asymStartTime         = 0;
-
-// Posture Tracking Timestamps & Flags
-let badHeadPoseStart      = null;
-let badYawStart           = null;
-let badTorsoStart         = null;
-let isHeadNodding         = false;
-let isHeadSlumping        = false;
-let isYawDrifting         = false;
-let isTorsoSlouching      = false;
-
-// Cooldown Timestamps
-const lastPenaltyAt       = {
-  longBlink: 0,
-  yawn:      0,
-  headDrop:  0,
-  asymmetry: 0,
-  slouch:    0,
-  yawDrift:  0
-};
-
-// Rolling 60s PERCLOS (P80)
-const PERCLOS_WINDOW_MS   = 60000;
-let perclosHistory        = [];
-let perclosSum            = 0;
-
-// Event Counters
-let totalEvents           = 0;
-let totalYawns            = 0;
-let totalLongBlinks       = 0;
-let totalHeadDrops        = 0;
-let totalSlouches         = 0;
-let totalYawDrifts        = 0;
-let sessionStart          = null;
-let sessionInterval       = null;
-let eventHistory          = [];
-
-// FPS Counter
-let fpsCount              = 0;
-let fpsTimer              = performance.now();
-
-// ── Chart.js Flight Telemetry Setup ──────────────────────────────────────────
-const N = 60;
-const lEH = Array(N).fill(0.28);
-const rEH = Array(N).fill(0.28);
-const mH  = Array(N).fill(0.10);
-const sH  = Array(N).fill(1.0);
-
-const telChart = new Chart(document.getElementById("telemetryChart"), {
-  type: "line",
-  data: {
-    labels: Array(N).fill(""),
-    datasets: [
-      { label: "L-EAR", data: lEH, borderColor: "#0284C7", borderWidth: 1.8, pointRadius: 0, tension: 0.3, yAxisID: "yL" },
-      { label: "R-EAR", data: rEH, borderColor: "#0EA5E9", borderWidth: 1.8, pointRadius: 0, tension: 0.3, yAxisID: "yL" },
-      { label: "MAR",   data: mH,  borderColor: "#D97706", borderWidth: 1.8, pointRadius: 0, tension: 0.3, yAxisID: "yL" },
-      { label: "Score", data: sH,  borderColor: "#059669", borderWidth: 1.8, pointRadius: 0, tension: 0.3,
-        yAxisID: "yR", fill: true, backgroundColor: "rgba(5, 150, 105, 0.08)" }
-    ]
-  },
-  options: {
-    animation: false,
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: { legend: { display: false } },
-    scales: {
-      x:  { display: false },
-      yL: { position: "left",  min: 0, max: 1,   grid: { color: "#E2E8F0" }, ticks: { color: "#64748B", font: { size: 9 } } },
-      yR: { position: "right", min: 0, max: 100, grid: { drawOnChartArea: false }, ticks: { color: "#059669", font: { size: 9 } } }
-    }
-  }
-});
-
-// ── Mathematical & Biometric Helpers ─────────────────────────────────────────
-
-/**
- * Aspect-ratio corrected 2D Euclidean distance in pixels.
- */
-function dist2D(p1, p2) {
-  if (!p1 || !p2) return 0;
-  const w = canvas.width  || 640;
-  const h = canvas.height || 480;
-  const dx = (p1.x - p2.x) * w;
-  const dy = (p1.y - p2.y) * h;
-  return Math.sqrt(dx * dx + dy * dy);
-}
-
-/**
- * Eye Aspect Ratio (EAR) for a single eye.
- */
-function calcEAR(lm, idx) {
-  if (!lm) return 0.28;
-  const v1 = dist2D(lm[idx[2]], lm[idx[4]]);
-  const v2 = dist2D(lm[idx[3]], lm[idx[5]]);
-  const h  = dist2D(lm[idx[0]], lm[idx[1]]);
-  return h < 1e-4 ? 0.28 : (v1 + v2) / (2.0 * h);
-}
-
-/**
- * Mouth Aspect Ratio (MAR) for yawn detection.
- */
-function calcMAR(lm) {
-  if (!lm) return 0.10;
-  const v = dist2D(lm[MOUTH[2]], lm[MOUTH[3]]);
-  const h = dist2D(lm[MOUTH[0]], lm[MOUTH[1]]);
-  return h < 1e-4 ? 0.10 : v / h;
-}
-
-/**
- * 2D Face Pitch Ratio (Height / Width).
- * Forehead (10) to Chin (152) vs Left Tragus (234) to Right Tragus (454).
- * This is the PRIMARY and most reliable head pitch signal:
- * — When head pitches forward (chin drops), vertical span foreshortens
- *   relative to fixed horizontal ear-to-ear span.
- * — Calibrated at upright; any ratio drop beyond threshold = nodding.
- */
-function calcPitchRatio(lm) {
-  if (!lm) return 1.0;
-  const faceH = dist2D(lm[FOREHEAD], lm[CHIN]);
-  const faceW = dist2D(lm[LEFT_EAR_PT], lm[RIGHT_EAR_PT]);
-  return faceW < 1e-4 ? 1.0 : faceH / faceW;
-}
-
-/**
- * Head Yaw in Degrees using 2D Ocular-Nasal Horizontal Projection.
- * Measures horizontal displacement of nose tip (pt 1) from the midpoint
- * of the two outer eye corners (pt 33 and pt 362), normalized by interocular distance.
- *
- * Physical basis:
- *  - When looking directly at camera: nose is centered between eyes -> yaw ~ 0°
- *  - When turning right (viewer perspective): nose shifts left -> negative yaw
- *  - When turning left (viewer perspective): nose shifts right -> positive yaw
- * Returns degrees ∈ [-60°, +60°].
- */
-function calcYawDeg(lm) {
-  if (!lm) return 0.0;
-  const w = canvas.width  || 640;
-  const rEyeX = lm[33].x * w;   // Right eye outer corner (viewer's left side)
-  const lEyeX = lm[362].x * w;  // Left eye outer corner (viewer's right side)
-  const noseX = lm[1].x * w;    // Nose tip
-
-  const eyeSpan = lEyeX - rEyeX;
-  if (eyeSpan < 15) return 0.0;
-
-  const eyeMidX = (lEyeX + rEyeX) / 2;
-  const dx = noseX - eyeMidX;
-  const normYaw = Math.max(-1, Math.min(1, dx / (eyeSpan * 0.45)));
-  return normYaw * 45.0; // Scaled to realistic angular degrees
-}
-
-/**
- * Head Lateral Roll/Tilt Angle in degrees.
- * Outer eye corner horizontal line deviation (pt 362 vs pt 33).
- */
-function calcTilt(lm) {
-  if (!lm) return 0.0;
-  const w = canvas.width  || 640;
-  const h = canvas.height || 480;
-  // pt 362 = left outer corner, pt 33 = right outer corner
-  const dx = (lm[362].x - lm[33].x) * w;
-  const dy = (lm[362].y - lm[33].y) * h;
-  return Math.atan2(dy, dx) * (180 / Math.PI);
-}
-
-/**
- * Vertical position of nose tip (normalized 0 to 1).
- * Used for detecting vertical chair sinking / slouching when shoulders are not visible.
- */
-function calcNoseY(lm) {
-  return lm ? lm[1].y : 0.45;
-}
-
-/**
- * Face height in pixels.
- */
-function calcFaceHeight(lm) {
-  return lm ? dist2D(lm[FOREHEAD], lm[CHIN]) : 150;
-}
-
-/**
- * Face width in pixels (scale / depth proxy).
- */
-function calcFaceWidth(lm) {
-  return lm ? dist2D(lm[LEFT_EAR_PT], lm[RIGHT_EAR_PT]) : 100;
-}
-
-/**
- * Upper-body pose metrics from MediaPipe PoseLandmarker.
- *
- * CRITICAL FIX: dx is (ls.x - rs.x) * w which is positive (~0.35 * width > 0).
- * This ensures atan2 is smoothly centered around 0° without 180° / -180° branch cut jumps!
- */
-function getPoseMetrics(poseLm, faceLm) {
-  if (!poseLm || poseLm.length < 13) return null;
-  const ls = poseLm[POSE_LEFT_SHOULDER];  // Pt 11 (user's left = viewer's right, x ~ 0.65-0.75)
-  const rs = poseLm[POSE_RIGHT_SHOULDER]; // Pt 12 (user's right = viewer's left, x ~ 0.25-0.35)
-  if (!ls || !rs) return null;
-
-  const visL = ls.visibility !== undefined ? ls.visibility : 1.0;
-  const visR = rs.visibility !== undefined ? rs.visibility : 1.0;
-  if (visL < 0.35 || visR < 0.35) return null;
-
-  const w = canvas.width  || 640;
-  const h = canvas.height || 480;
-
-  // IMPORTANT: (ls.x - rs.x) > 0 so atan2(dy, dx) is continuously centered at 0°!
-  const dx = (ls.x - rs.x) * w;
-  const dy = (ls.y - rs.y) * h;
-  const shoulderSpan = Math.sqrt(dx * dx + dy * dy);
-  if (shoulderSpan < 25) return null;
-
-  // SIGNED shoulder tilt angle around 0° (positive = left shoulder lower, negative = right lower)
-  const shoulderTilt = Math.atan2(dy, dx) * (180 / Math.PI);
-
-  // Spinal / neck vertical clearance: distance from chin to shoulder midpoint.
-  // In screen coordinates Y increases downward, so shoulders_midY > chin_Y normally.
-  const midY  = ((ls.y + rs.y) / 2) * h;
-  const chinY = faceLm ? (faceLm[CHIN].y * h) : (poseLm[0] ? poseLm[0].y * h : midY * 0.85);
-  const neckVertDist = midY - chinY; // Positive when upright (chin above shoulders)
-
-  // Normalize to shoulder span so camera-distance changes don't distort it
-  const spineRatio = neckVertDist / shoulderSpan;
-
-  return { shoulderSpan, shoulderTilt, neckVertDist, spineRatio, ls, rs };
-}
-
-/**
- * Scientifically Standardized Time-Windowed PERCLOS (P80).
- * Calculates eye closure percentage over rolling 60s in O(1) time.
- */
-function calcPerclosTimeWindow(eyeClosed, now) {
-  perclosHistory.push({ t: now, closed: eyeClosed ? 1 : 0 });
-  if (eyeClosed) perclosSum++;
-
-  const cutoff = now - PERCLOS_WINDOW_MS;
-  while (perclosHistory.length > 0 && perclosHistory[0].t < cutoff) {
-    if (perclosHistory[0].closed) perclosSum--;
-    perclosHistory.shift();
-  }
-
-  return perclosHistory.length > 0 ? (perclosSum / perclosHistory.length) * 100 : 0;
-}
-
-/**
- * Penalty deduction with debounce cooldown.
- */
-function penalise(type) {
-  const now = performance.now();
-  if (now - (lastPenaltyAt[type] || 0) >= (COOLDOWN[type] || 3000)) {
-    lastPenaltyAt[type] = now;
-    alertnessScore = Math.max(0, alertnessScore - (PENALTY[type] || 15));
-    return true;
-  }
-  return false;
-}
-
-/**
- * Helper to update cockpit annunciator cells.
- * state: "ok" | "warn" | "bad" | "info"
- */
-function setIndicator(el, state, text) {
-  if (!el) return;
-  el.className = `posture-cell ${state}`;
-  const stateEl = el.querySelector(".ind-state");
-  if (stateEl && text) stateEl.textContent = text;
-}
-
-// ── Enhanced Biometric Heuristic Engine ───────────────────────────────────────
-function runHeuristics(lm, poseLm) {
-  const now = performance.now();
-
-  // Frame-rate independent delta time (seconds)
-  const dtSec = Math.min(0.2, (now - lastScoreUpdateTime) / 1000);
-  lastScoreUpdateTime = now;
-
-  // 1. Raw Feature Extraction
-  const rawLeftEAR    = calcEAR(lm, LEFT_EYE);
-  const rawRightEAR   = calcEAR(lm, RIGHT_EYE);
-  const rawMAR        = calcMAR(lm);
-  const rawPitchRatio = calcPitchRatio(lm);
-  const rawYawDeg     = calcYawDeg(lm);
-  const rawTiltDeg    = calcTilt(lm);
-  const rawNoseY      = calcNoseY(lm);
-  const rawFaceHeight = calcFaceHeight(lm);
-  const rawFaceWidth  = calcFaceWidth(lm);
-  const poseData      = getPoseMetrics(poseLm, lm);
-
-  // 2. Exponential Moving Average — ocular signals
-  smoothL_EAR = smoothL_EAR === null ? rawLeftEAR  : (EMA_ALPHA * rawLeftEAR  + (1 - EMA_ALPHA) * smoothL_EAR);
-  smoothR_EAR = smoothR_EAR === null ? rawRightEAR : (EMA_ALPHA * rawRightEAR + (1 - EMA_ALPHA) * smoothR_EAR);
-  smoothMAR   = smoothMAR   === null ? rawMAR      : (EMA_ALPHA * rawMAR      + (1 - EMA_ALPHA) * smoothMAR);
-
-  // Posture EMA — responsive smoothing
-  smoothPitchRatio = smoothPitchRatio === null ? rawPitchRatio : (EMA_POSTURE_ALPHA * rawPitchRatio + (1 - EMA_POSTURE_ALPHA) * smoothPitchRatio);
-  smoothYawDeg     = smoothYawDeg     === null ? rawYawDeg     : (EMA_POSTURE_ALPHA * rawYawDeg     + (1 - EMA_POSTURE_ALPHA) * smoothYawDeg);
-  smoothTiltDeg    = smoothTiltDeg    === null ? rawTiltDeg    : (EMA_POSTURE_ALPHA * rawTiltDeg    + (1 - EMA_POSTURE_ALPHA) * smoothTiltDeg);
-  smoothNoseY      = smoothNoseY      === null ? rawNoseY      : (EMA_POSTURE_ALPHA * rawNoseY      + (1 - EMA_POSTURE_ALPHA) * smoothNoseY);
-
-  const leftEAR  = smoothL_EAR;
-  const rightEAR = smoothR_EAR;
-  const mar      = smoothMAR;
-
-  // 3. Per-Eye Closure & Relative Asymmetry
-  const leftEAR_T  = baselineLeftEAR  * EAR_CLOSED_RATIO;
-  const rightEAR_T = baselineRightEAR * EAR_CLOSED_RATIO;
-
-  leftEyeClosed  = leftEAR  < leftEAR_T;
-  rightEyeClosed = rightEAR < rightEAR_T;
-
-  const eitherClosed = leftEyeClosed || rightEyeClosed;
-  const bothClosed   = leftEyeClosed && rightEyeClosed;
-
-  // Normalized Asymmetry
-  const lRatio = leftEAR  / Math.max(0.08, baselineLeftEAR);
-  const rRatio = rightEAR / Math.max(0.08, baselineRightEAR);
-  const relativeAsym = Math.abs(lRatio - rRatio);
-
-  // 4. Rolling 60s PERCLOS
-  const perclos = calcPerclosTimeWindow(eitherClosed, now);
-
-  // 5. Long Blink / Micro-Sleep Detection
-  if (eitherClosed) {
-    if (!isBlinking) {
-      isBlinking     = true;
-      longBlinkFired = false;
-      blinkStartTime = now;
-    } else if (!longBlinkFired && (now - blinkStartTime) >= LONG_BLINK_MS) {
-      longBlinkFired = true;
-      if (penalise("longBlink")) {
-        const which = bothClosed ? "BILATERAL" : leftEyeClosed ? "LEFT EYE" : "RIGHT EYE";
-        logEvent(`MICRO-SLEEP DETECTED (${which} CLOSED > 1.5s)`, "longblink");
-        totalLongBlinks++;
-        longBlinkCountR.textContent = totalLongBlinks;
-      }
-    }
-  } else {
-    isBlinking     = false;
-    longBlinkFired = false;
-  }
-
-  // 6. One-Eye Droop (Relative Asymmetry Detection)
-  if (relativeAsym > EAR_ASYM_THRESH && !bothClosed) {
-    if (!asymFired) {
-      asymFired     = true;
-      asymStartTime = now;
-    } else if ((now - asymStartTime) >= 1100) {
-      asymFired = false;
-      if (penalise("asymmetry")) {
-        const droppingEye = lRatio < rRatio ? "LEFT" : "RIGHT";
-        logEvent(`UNILATERAL EYE DROOP (${droppingEye} EYE >32% ASYMMETRY)`, "asym");
-      }
-    }
-  } else {
-    asymFired = false;
-  }
-
-  // 7. Yawn Detection
-  const MAR_T = baselineMAR * MAR_YAWN_RATIO;
-  if (mar > MAR_T) {
-    if (!isYawning) {
-      isYawning     = true;
-      yawnFired     = false;
-      yawnStartTime = now;
-    } else if (!yawnFired && (now - yawnStartTime) >= YAWN_MIN_MS) {
-      yawnFired = true;
-      if (penalise("yawn")) {
-        logEvent(`PROLONGED YAWN DETECTED (${mar.toFixed(2)} MAR)`, "yawn");
-        totalYawns++;
-        yawnCountR.textContent = totalYawns;
-      }
-    }
-  } else {
-    isYawning = false;
-    yawnFired = false;
-  }
-
-  // ── 8. Enhanced Posture Engine ───────────────────────────────────────────────
-  // A. HEAD PITCH (Forward Nod) — Percentage foreshortening from upright baseline
-  const pitchDropPct = ((baselinePitchRatio - smoothPitchRatio) / Math.max(0.1, baselinePitchRatio)) * 100;
-  isHeadNodding = pitchDropPct > HEAD_PITCH_DROP_PCT;
-
-  // B. HEAD ROLL (Lateral Slump) — Outer eye corner roll deviation in degrees
-  const tiltDelta = Math.abs(smoothTiltDeg - baselineTilt);
-  isHeadSlumping = tiltDelta > HEAD_TILT_DEG;
-
-  // C. HEAD YAW (Cockpit Inattention) — 2D ocular-nasal azimuth in degrees
-  const yawDelta = Math.abs(smoothYawDeg - baselineYawDeg);
-  isYawDrifting = yawDelta > HEAD_YAW_DEG_THRESH;
-
-  // D. TORSO / SPINAL POSTURE
-  let isShoulderDroop = false;
-  let isSpinalSlouch  = false;
-  let hasUpperBody    = false;
-
-  if (poseData && baselineSpineRatio !== null) {
-    hasUpperBody = true;
-
-    smoothSpineRatio   = smoothSpineRatio   === null ? poseData.spineRatio   : (EMA_POSTURE_ALPHA * poseData.spineRatio   + (1 - EMA_POSTURE_ALPHA) * smoothSpineRatio);
-    smoothShoulderTilt = smoothShoulderTilt === null ? poseData.shoulderTilt : (EMA_POSTURE_ALPHA * poseData.shoulderTilt + (1 - EMA_POSTURE_ALPHA) * smoothShoulderTilt);
-
-    const shoulderTiltDelta = Math.abs(smoothShoulderTilt - baselineShoulderTilt);
-    isShoulderDroop = shoulderTiltDelta > SHOULDER_TILT_DEG;
-    isSpinalSlouch  = smoothSpineRatio < (baselineSpineRatio * (1 - SPINE_SLOUCH_RATIO_DROP));
-
-  } else {
-    // Camera cropped to head/desk fallback:
-    // 1. Seat vertical sink: nose tip moves down in frame relative to face height
-    const faceH = Math.max(50, rawFaceHeight);
-    const sinkRatio = ((smoothNoseY - baselineNoseY) * (canvas.height || 480)) / faceH;
-    // 2. Leaning back away from desk: face width drops without yawing
-    const scaleRatio = rawFaceWidth / Math.max(1, baselineFaceWidth);
-
-    isSpinalSlouch = (sinkRatio > SINK_SLOUCH_DROP) || (!isYawDrifting && scaleRatio < (1 - Z_SLOUCH_DROP));
-  }
-
-  isTorsoSlouching = isShoulderDroop || isSpinalSlouch;
-
-  // Active postural fatigue for regen suppression
-  const headPostureBad  = isHeadNodding || isHeadSlumping;
-  const torsoPostureBad = isTorsoSlouching;
-  const anyPenaltyPosture = headPostureBad || torsoPostureBad;
-
-  // Persistence & Penalty: Head Nod / Lateral Slump (500ms debounce)
-  if (headPostureBad) {
-    if (!badHeadPoseStart) {
-      badHeadPoseStart = now;
-    } else if ((now - badHeadPoseStart) >= HEAD_PERSIST_MS) {
-      if (penalise("headDrop")) {
-        const reason = isHeadNodding
-          ? `FORWARD HEAD NOD (−${pitchDropPct.toFixed(0)}% FORESHORTEN)`
-          : `LATERAL HEAD SLUMP (${tiltDelta.toFixed(0)}° ROLL)`;
-        logEvent(`POSTURAL FATIGUE: ${reason}`, "head");
-        totalHeadDrops++;
-        headDropCountR.textContent = totalHeadDrops + totalSlouches;
-      }
-      badHeadPoseStart = null;
-    }
-  } else {
-    badHeadPoseStart = null;
-  }
-
-  // Persistence & Penalty: Yaw Inattention (2.8s sustained)
-  if (isYawDrifting) {
-    if (!badYawStart) {
-      badYawStart = now;
-    } else if ((now - badYawStart) >= HEAD_YAW_MS) {
-      if (penalise("yawDrift")) {
-        const dir = smoothYawDeg > baselineYawDeg ? "RIGHT" : "LEFT";
-        logEvent(`FLIGHT INATTENTION: HEAD TURNED ${dir} (${yawDelta.toFixed(0)}° YAW > 2.8s)`, "caution");
-        totalYawDrifts++;
-      }
-      badYawStart = null;
-    }
-  } else {
-    badYawStart = null;
-  }
-
-  // Persistence & Penalty: Torso / Spinal Slouch (900ms sustained)
-  if (torsoPostureBad) {
-    if (!badTorsoStart) {
-      badTorsoStart = now;
-    } else if ((now - badTorsoStart) >= TORSO_PERSIST_MS) {
-      if (penalise("slouch")) {
-        const slouchReason = isShoulderDroop ? "SHOULDER LISTING / DROOP" : "SPINAL SLOUCH (TORSO COMPRESSION)";
-        logEvent(`POSTURAL FATIGUE: ${slouchReason}`, "head");
-        totalSlouches++;
-        headDropCountR.textContent = totalHeadDrops + totalSlouches;
-      }
-      badTorsoStart = null;
-    }
-  } else {
-    badTorsoStart = null;
-  }
-
-  // 9. Frame-Rate Independent Score Regeneration
-  // Blocked only by active ocular fatigue or confirmed head/torso posture events.
-  // Yaw inattention does NOT block regen (it has its own separate penalty).
-  if (!eitherClosed && !isYawning && !anyPenaltyPosture) {
-    alertnessScore = Math.min(100, alertnessScore + REGEN_PER_SEC * dtSec);
-  }
-
-  // 10. Continuous PERCLOS Drag Penalty
-  if (perclos > 20) {
-    alertnessScore = Math.max(0, alertnessScore - 1.5 * dtSec);
-  } else if (perclos > 15) {
-    alertnessScore = Math.max(0, alertnessScore - 0.6 * dtSec);
-  }
-
-  // 11. Safety Interlock: Automatic Grounding at Critical Score (≤ 25)
-  if (alertnessScore <= AUTO_GROUND_SCORE && !sessionEnding) {
-    sessionEnding = true;
-    logEvent("SAFETY INTERLOCK: CRITICAL SCORE — AUTOMATIC FLIGHT GROUNDING", "critical");
-    setTimeout(() => endSession(true), 1200);
-  }
-
-  // 12. Update UI Metric Displays
-  leftEarVal.textContent  = leftEAR.toFixed(3);
-  rightEarVal.textContent = rightEAR.toFixed(3);
-  marVal.textContent      = mar.toFixed(3);
-  perclosVal.textContent  = perclos.toFixed(1) + "%";
-
-  // Posture metric card: live angle/status
-  if (isHeadNodding) {
-    postureVal.textContent = `-${pitchDropPct.toFixed(0)}% NOD`;
-  } else if (isHeadSlumping) {
-    postureVal.textContent = `${tiltDelta.toFixed(0)}° ROLL`;
-  } else if (isTorsoSlouching) {
-    postureVal.textContent = isShoulderDroop ? "DROOP" : "SLOUCH";
-  } else if (isYawDrifting) {
-    const dir = smoothYawDeg > baselineYawDeg ? "R" : "L";
-    postureVal.textContent = `${yawDelta.toFixed(0)}° YAW-${dir}`;
-  } else {
-    postureVal.textContent = "LEVEL";
-  }
-
-  // Status cell micro-badges
-  if (stLear)    stLear.textContent    = leftEyeClosed ? "Closed" : leftEAR < (baselineLeftEAR * 0.85) ? "Strained" : "Normal";
-  if (stRear)    stRear.textContent    = rightEyeClosed ? "Closed" : rightEAR < (baselineRightEAR * 0.85) ? "Strained" : "Normal";
-  if (stMar)     stMar.textContent     = mar > MAR_T ? "Yawning" : mar > (MAR_T * 0.6) ? "Speaking" : "Closed";
-  if (stPerclos) stPerclos.textContent = perclos > 20 ? "Critical" : perclos > 15 ? "Elevated" : "Optimal";
-  if (stPosture) {
-    stPosture.textContent = isHeadNodding    ? "Forward Nod" :
-                            isHeadSlumping   ? "Lateral Slump" :
-                            isTorsoSlouching ? (isShoulderDroop ? "Shoulder Droop" : "Torso Slouch") :
-                            isYawDrifting    ? "Inattentive" : "Upright";
-  }
-
-  const postureChip = document.getElementById("posture-chip");
-  if (postureChip) {
-    postureChip.textContent = hasUpperBody ? "TORSO+HEAD" : "HEAD 3D";
-  }
-
-  // Cockpit Annunciator Indicators
-  const lEyeState = leftEyeClosed ? "bad" : leftEAR < (baselineLeftEAR * 0.85) ? "warn" : "ok";
-  const rEyeState = rightEyeClosed ? "bad" : rightEAR < (baselineRightEAR * 0.85) ? "warn" : "ok";
-  const mState    = mar > MAR_T ? "bad" : mar > (MAR_T * 0.6) ? "warn" : "ok";
-
-  const headState = headPostureBad ? "bad" : isYawDrifting ? "warn" : "ok";
-  const headText  = isHeadNodding ? "NODDING" : isHeadSlumping ? "SLUMP" : isYawDrifting ? "YAW DRIFT" : "LEVEL";
-
-  const torsoState = torsoPostureBad ? "bad" : (hasUpperBody ? "ok" : "info");
-  const torsoText  = isTorsoSlouching ? (isShoulderDroop ? "DROOP" : "SLOUCH") : (hasUpperBody ? "UPRIGHT" : "DESK 3D");
-
-  setIndicator(indLeftEye,  lEyeState,  leftEyeClosed ? "CLOSED" : leftEAR < (baselineLeftEAR * 0.85) ? "DROOP" : "NORMAL");
-  setIndicator(indRightEye, rEyeState,  rightEyeClosed ? "CLOSED" : rightEAR < (baselineRightEAR * 0.85) ? "DROOP" : "NORMAL");
-  setIndicator(indMouth,    mState,     mar > MAR_T ? "YAWNING" : mar > (MAR_T * 0.6) ? "OPEN" : "CLOSED");
-  setIndicator(indHeadPose, headState,  headText);
-  setIndicator(indTorso,    torsoState, torsoText);
-
-  return { leftEAR, rightEAR, avgEAR: (leftEAR + rightEAR) / 2, mar };
-}
-
-// ── Dashboard Updates ─────────────────────────────────────────────────────────
-function updateDashboard(leftEAR, rightEAR, mar) {
-  const s = Math.floor(alertnessScore);
-  scoreNumber.textContent = s;
-
-  let color, label, pillClass, pillText;
-  if (s >= 75) {
-    color = "#059669"; label = "FIT TO FLY · CLEARED";
-    pillClass = "active"; pillText = "OPTIMAL — CLEAR FOR FLIGHT";
-    alertBanner.classList.add("hidden");
-  } else if (s >= 45) {
-    color = "#D97706"; label = "FATIGUED · MONITORING REQUIRED";
-    pillClass = "caution"; pillText = "CAUTION — ELEVATED FATIGUE";
-    alertBanner.classList.add("hidden");
-  } else if (s > AUTO_GROUND_SCORE) {
-    color = "#DC2626"; label = "HIGH RISK · GROUNDING RECOMMENDED";
-    pillClass = "critical"; pillText = "CRITICAL — REPLACEMENT REQUIRED";
-    alertBanner.classList.remove("hidden");
-  } else {
-    color = "#DC2626"; label = "UNFIT TO FLY · GROUNDED";
-    pillClass = "critical"; pillText = "CRITICAL — GROUNDED AUTOMATICALLY";
-    alertBanner.classList.remove("hidden");
-  }
-
-  scoreNumber.style.color = color;
-  scoreLabel.style.color  = color;
-  scoreLabel.textContent  = label;
-  statusPill.className    = `pill ${pillClass}`;
-  if (statusText) statusText.textContent = pillText;
-  drawGauge(s, color);
-
-  lEH.push(leftEAR);  lEH.shift();
-  rEH.push(rightEAR); rEH.shift();
-  mH.push(mar);       mH.shift();
-  sH.push(s / 100);   sH.shift();
-  telChart.update("none");
-}
-
-// ── Flight Deck Gauge ─────────────────────────────────────────────────────────
-function drawGauge(score, color = "#94A3B8") {
-  const dpr = window.devicePixelRatio || 1;
-  const w = 220;
-  const h = 130;
-
-  if (gaugeCanvas.width !== w * dpr) {
-    gaugeCanvas.width = w * dpr;
-    gaugeCanvas.height = h * dpr;
-    gaugeCanvas.style.width = `${w}px`;
-    gaugeCanvas.style.height = `${h}px`;
-  }
-
-  gaugeCtx.save();
-  gaugeCtx.scale(dpr, dpr);
-  gaugeCtx.clearRect(0, 0, w, h);
-
-  const cx = w / 2;
-  const cy = h - 14;
-  const r = 82;
-
-  // Segmented graduation ticks around outer track
-  const totalTicks = 24;
-  for (let i = 0; i <= totalTicks; i++) {
-    const angle = Math.PI + (i / totalTicks) * Math.PI;
-    const isMajor = i % 6 === 0;
-    const tickLen = isMajor ? 6 : 3;
-    const r1 = r + 13;
-    const r2 = r1 + tickLen;
-    gaugeCtx.beginPath();
-    gaugeCtx.moveTo(cx + Math.cos(angle) * r1, cy + Math.sin(angle) * r1);
-    gaugeCtx.lineTo(cx + Math.cos(angle) * r2, cy + Math.sin(angle) * r2);
-    gaugeCtx.strokeStyle = isMajor ? "#94A3B8" : "#E2E8F0";
-    gaugeCtx.lineWidth = isMajor ? 1.5 : 1;
-    gaugeCtx.stroke();
-  }
-
-  // Base background arc
-  gaugeCtx.beginPath();
-  gaugeCtx.arc(cx, cy, r, Math.PI, 2 * Math.PI);
-  gaugeCtx.strokeStyle = "#E2E8F0";
-  gaugeCtx.lineWidth = 14;
-  gaugeCtx.lineCap = "round";
-  gaugeCtx.stroke();
-
-  // Active score arc
-  if (score > 0) {
-    const endAngle = Math.PI + (Math.max(0, Math.min(100, score)) / 100) * Math.PI;
-    gaugeCtx.beginPath();
-    gaugeCtx.arc(cx, cy, r, Math.PI, endAngle);
-    gaugeCtx.strokeStyle = color;
-    gaugeCtx.lineWidth = 14;
-    gaugeCtx.lineCap = "round";
-    gaugeCtx.stroke();
-  }
-
-  // Needle Pivot Hub
-  gaugeCtx.beginPath();
-  gaugeCtx.arc(cx, cy, 6, 0, 2 * Math.PI);
-  gaugeCtx.fillStyle = color;
-  gaugeCtx.fill();
-
-  gaugeCtx.beginPath();
-  gaugeCtx.arc(cx, cy, 2.5, 0, 2 * Math.PI);
-  gaugeCtx.fillStyle = "#FFFFFF";
-  gaugeCtx.fill();
-
-  gaugeCtx.restore();
-}
-
-// ── Operational Event Logger ──────────────────────────────────────────────────
-function logEvent(text, type = "info") {
-  const time = new Date().toTimeString().slice(0, 8);
-  totalEvents++;
-  eventCount.textContent = totalEvents;
-  eventCountBadge.textContent = `${totalEvents} event${totalEvents === 1 ? "" : "s"}`;
-
-  eventHistory.unshift({ time, text, type });
-  if (eventHistory.length > 50) eventHistory.pop();
-
-  const empty = eventLog.querySelector(".log-empty");
-  if (empty) empty.remove();
-
-  const li = document.createElement("li");
-  li.className = `log-entry log-${type}`;
-  li.innerHTML = `
-    <span class="log-time mono">${time}</span>
-    <span class="log-msg">${text}</span>`;
-  eventLog.prepend(li);
-  while (eventLog.children.length > 30) eventLog.lastElementChild.remove();
-}
-
-// ── Session Timer & Clocks ────────────────────────────────────────────────────
-function startSessionTimer() {
-  sessionStart = Date.now();
-  sessionInterval = setInterval(() => {
-    const elapsed = Math.floor((Date.now() - sessionStart) / 1000);
-    const m = String(Math.floor(elapsed / 60)).padStart(2, "0");
-    const s = String(elapsed % 60).padStart(2, "0");
-    sessionTimeEl.textContent = `${m}:${s}`;
-  }, 1000);
-}
-
-function updateClocks() {
-  const d = new Date();
-  clockEl.textContent = d.toTimeString().slice(0, 8);
-  utcClockEl.textContent = d.toISOString().slice(11, 19) + " UTC";
-}
-setInterval(updateClocks, 1000);
-updateClocks();
-
-function tickFPS() {
-  fpsCount++;
-  const now = performance.now();
-  if (now - fpsTimer >= 1000) {
-    fpsBadge.textContent = `${fpsCount} FPS`;
-    fpsCount = 0;
-    fpsTimer = now;
-  }
-}
-
-// ── Calibration Flow ──────────────────────────────────────────────────────────
-function startCalibration() {
-  calibModal.classList.add("hidden");
-  calibProgress.classList.remove("hidden");
-  isCalibrating = true;
-  calibFrames   = [];
-
-  let count = 10;
-  calibCountdown.textContent = count;
-  calibBar.style.width = "0%";
-
-  const iv = setInterval(() => {
-    count--;
-    calibCountdown.textContent = count;
-    calibBar.style.width = `${((10 - count) / 10) * 100}%`;
-    if (count <= 0) {
-      clearInterval(iv);
-      finishCalibration();
-    }
-  }, 1000);
-}
-
-function finishCalibration() {
-  isCalibrating = false;
-
-  if (calibFrames.length >= 15) {
-    const sort = arr => [...arr].sort((a, b) => a - b);
-
-    // Individual per-eye baselines
-    const sortedL_EAR = sort(calibFrames.map(f => f.leftEAR));
-    const sortedR_EAR = sort(calibFrames.map(f => f.rightEAR));
-    const openEyeIdx  = Math.floor(sortedL_EAR.length * 0.65);
-
-    baselineLeftEAR  = Math.max(0.18, Math.min(0.45, sortedL_EAR[openEyeIdx]));
-    baselineRightEAR = Math.max(0.18, Math.min(0.45, sortedR_EAR[openEyeIdx]));
-    baselineEAR      = (baselineLeftEAR + baselineRightEAR) / 2;
-
-    // Resting mouth MAR
-    const sortedMAR = sort(calibFrames.map(f => f.mar));
-    const restingMouthIdx = Math.floor(sortedMAR.length * 0.30);
-    baselineMAR = Math.max(0.06, Math.min(0.28, sortedMAR[restingMouthIdx]));
-
-    // 3D Head Euler & Pitch baselines (median of calibration frames)
-    const sortedPitchRatio = sort(calibFrames.map(f => f.pitchRatio));
-    baselinePitchRatio = sortedPitchRatio[Math.floor(sortedPitchRatio.length / 2)];
-
-    // Upright Head Yaw baseline (median in degrees, ~0° when facing camera)
-    const sortedYawDeg = sort(calibFrames.map(f => f.yawDeg));
-    baselineYawDeg = sortedYawDeg[Math.floor(sortedYawDeg.length / 2)];
-
-    // Upright Head Roll/Tilt baseline (median in degrees)
-    const sortedTilt = sort(calibFrames.map(f => f.tiltDeg));
-    baselineTilt = sortedTilt[Math.floor(sortedTilt.length / 2)];
-
-    // Upright Nose Y position (median for seat sink detection)
-    const sortedNoseY = sort(calibFrames.map(f => f.noseY));
-    baselineNoseY = sortedNoseY[Math.floor(sortedNoseY.length / 2)];
-
-    const sortedFaceW = sort(calibFrames.map(f => f.faceWidth));
-    baselineFaceWidth = sortedFaceW[Math.floor(sortedFaceW.length / 2)];
-
-    // Shoulder & Spinal baseline (if upper body visible)
-    const validPoses = calibFrames.map(f => f.poseData).filter(p => p !== null);
-    if (validPoses.length >= 8) {
-      const sortedShoulderTilt = sort(validPoses.map(p => p.shoulderTilt));
-      baselineShoulderTilt = sortedShoulderTilt[Math.floor(sortedShoulderTilt.length / 2)];
-
-      const sortedSpineRatio = sort(validPoses.map(p => p.spineRatio));
-      baselineSpineRatio = sortedSpineRatio[Math.floor(sortedSpineRatio.length / 2)];
-      hasUpperBodyBaseline = true;
-    } else {
-      baselineShoulderTilt = 0.0;
-      baselineSpineRatio = null;
-      hasUpperBodyBaseline = false;
-    }
-  }
-
-  // Initialise smoothing filters at calibrated baselines
-  smoothL_EAR         = baselineLeftEAR;
-  smoothR_EAR         = baselineRightEAR;
-  smoothMAR           = baselineMAR;
-  smoothPitchRatio    = baselinePitchRatio;
-  smoothYawDeg        = baselineYawDeg;
-  smoothTiltDeg       = baselineTilt;
-  smoothNoseY         = baselineNoseY;
-  smoothSpineRatio    = baselineSpineRatio;
-  smoothShoulderTilt  = baselineShoulderTilt;
-  perclosHistory      = [];
-  perclosSum          = 0;
-  lastScoreUpdateTime = performance.now();
-
-  calibProgress.classList.add("hidden");
-  sessionActive  = true;
-  sessionEnding  = false;
-  alertnessScore = 100;
-  scanLine.classList.remove("hidden");
-
-  btnStart.innerHTML = `
-    <svg class="btn-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-      <rect x="6" y="6" width="12" height="12" rx="2"/>
-    </svg>
-    <span>END SESSION</span>`;
-  btnStart.classList.remove("btn-primary");
-  btnStart.classList.add("btn-danger");
-  btnStart.disabled = false;
-
-  scoreNumber.textContent = "100";
-  scoreNumber.style.color = "#059669";
-  scoreLabel.textContent  = "FIT TO FLY · CLEARED";
-  scoreLabel.style.color  = "#059669";
-  drawGauge(100, "#059669");
-  startSessionTimer();
-
-  const bodyStatusStr = hasUpperBodyBaseline ? "UPPER-BODY SKELETON ENGAGED" : "3D FACE POSE ACTIVE";
-  logEvent(
-    `CALIBRATION VERIFIED — L-EAR: ${baselineLeftEAR.toFixed(3)} | R-EAR: ${baselineRightEAR.toFixed(3)} | ${bodyStatusStr}`,
-    "system"
-  );
-}
-
-// ── End Session & Fitness Certificate ─────────────────────────────────────────
-function endSession(autoGrounded = false) {
-  sessionActive = false;
-  sessionEnding = false;
-  clearInterval(sessionInterval);
-  scanLine.classList.add("hidden");
-
-  const s = Math.floor(alertnessScore);
-  let verdict, color, rec;
-
-  if (autoGrounded || s <= AUTO_GROUND_SCORE) {
-    color   = "#DC2626";
-    verdict = "UNFIT TO FLY — GROUNDED";
-    rec     = "✖ Automatic flight safety interlock triggered. Immediate crew replacement required.";
-  } else if (s >= 75) {
-    color   = "#059669";
-    verdict = "FIT TO FLY — CLEARED";
-    rec     = "✔ Pilot cleared for all regular flight deck operations.";
-  } else if (s >= 45) {
-    color   = "#D97706";
-    verdict = "MONITORING REQUIRED";
-    rec     = "⚠ Elevated fatigue indicators detected. Dispatch review recommended.";
-  } else {
-    color   = "#DC2626";
-    verdict = "UNFIT TO FLY";
-    rec     = "✖ Critical fatigue detected. Replacement pilot mandated.";
-  }
-
-  resultScore.textContent   = s;
-  resultScore.style.color   = color;
-  resultVerdict.textContent = verdict;
-  resultVerdict.style.color = color;
-  resultDetails.innerHTML   =
-    `<b>Duration:</b> ${sessionTimeEl.textContent}<br>
-     <b>Final score:</b> ${s} / 100<br>
-     <b>Long blinks (Micro-sleep):</b> ${totalLongBlinks}<br>
-     <b>Yawns:</b> ${totalYawns}<br>
-     <b>Head drops / Slumps:</b> ${totalHeadDrops}<br>
-     <b>Torso / Spine slouches:</b> ${totalSlouches}<br>
-     <b>Inattention gaze drifts:</b> ${totalYawDrifts}<br>
-     <b>Total biometric events:</b> ${totalEvents}<br>
-     <b>PERCLOS (Rolling 60s):</b> ${perclosVal.textContent}<br><br>
-     <b>Outcome:</b> ${rec}`;
-
-  resultModal.classList.remove("hidden");
-  statusPill.className   = "pill idle";
-  if (statusText) statusText.textContent = "SESSION COMPLETE";
-
-  btnStart.innerHTML = `
-    <svg class="btn-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-      <polygon points="5 3 19 12 5 21 5 3"/>
-    </svg>
-    <span>BEGIN EVALUATION</span>`;
-  btnStart.classList.remove("btn-danger");
-  btnStart.classList.add("btn-primary");
-  btnStart.disabled = false;
-}
-
-// ── Real-Time Prediction Loop ─────────────────────────────────────────────────
-function predictWebcam() {
-  requestAnimationFrame(predictWebcam);
-  if (!faceLandmarker || video.readyState < 2) return;
-  if (video.currentTime === lastVideoTime) return;
-  lastVideoTime = video.currentTime;
-
-  canvas.width  = video.videoWidth  || 640;
-  canvas.height = video.videoHeight || 480;
-  ctx2d.clearRect(0, 0, canvas.width, canvas.height);
-
-  const now = performance.now();
-
-  let faceResults = null;
+function loadStore() {
   try {
-    faceResults = faceLandmarker.detectForVideo(video, now);
+    const raw = localStorage.getItem(STORE_KEY);
+    const parsed = raw ? JSON.parse(raw) : null;
+    if (parsed && Array.isArray(parsed.sessions)) return parsed;
   } catch {
-    return;
+    // Corrupt or unavailable storage must not stop the check: start fresh.
   }
+  return { sessions: [] };
+}
 
-  let poseResults = null;
-  if (poseLandmarker && poseLandmarkerReady) {
-    try {
-      poseResults = poseLandmarker.detectForVideo(video, now);
-    } catch (e) {}
-  }
-
-  const faceLm = faceResults?.faceLandmarks?.[0] || null;
-  const poseLm = poseResults?.landmarks?.[0] || null;
-
-  if (faceLm) {
-    noFaceOverlay.classList.add("hidden");
-    if (hudTargetStatus) {
-      hudTargetStatus.textContent = poseLm ? "3D FUSED LOCK" : "FACE LOCKED";
-      hudTargetStatus.style.color = "#34D399";
-    }
-
-    if (sessionActive || isCalibrating) {
-      drawMesh(faceLm, poseLm);
-    }
-
-    if (isCalibrating) {
-      calibFrames.push({
-        leftEAR:    calcEAR(faceLm, LEFT_EYE),
-        rightEAR:   calcEAR(faceLm, RIGHT_EYE),
-        mar:        calcMAR(faceLm),
-        pitchRatio: calcPitchRatio(faceLm),
-        yawDeg:     calcYawDeg(faceLm),     // 2D ocular-nasal azimuth in degrees
-        tiltDeg:    calcTilt(faceLm),       // Symmetric outer-corner roll angle
-        noseY:      calcNoseY(faceLm),      // Nose vertical position in camera frame
-        faceWidth:  calcFaceWidth(faceLm),
-        poseData:   getPoseMetrics(poseLm, faceLm)
-      });
-    } else if (sessionActive) {
-      const { leftEAR, rightEAR, mar } = runHeuristics(faceLm, poseLm);
-      updateDashboard(leftEAR, rightEAR, mar);
-      tickFPS();
-    }
-  } else {
-    noFaceOverlay.classList.remove("hidden");
-    if (hudTargetStatus) {
-      hudTargetStatus.textContent = "SEARCHING";
-      hudTargetStatus.style.color = "rgba(56, 189, 248, 0.85)";
-    }
-    if (sessionActive) {
-      alertnessScore = Math.max(0, alertnessScore - 0.03);
-    }
+function saveStore(store) {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(store));
+  } catch {
+    // Private browsing or a full quota — the session still completes, it just
+    // does not contribute to the baseline.
   }
 }
 
-// ── Cockpit HUD Skeleton & Mesh Overlay ───────────────────────────────────────
-function drawMesh(faceLm, poseLm) {
-  const W = canvas.width;
-  const H = canvas.height;
-  const FL = window.FaceLandmarker;
+const baselineSessions = (store) => store.sessions.filter((s) => s.baseline);
 
-  // 1. Upper Body Skeleton HUD (Shoulder beam & spine axis)
-  if (poseLm && poseLm.length > 12) {
-    const ls = poseLm[POSE_LEFT_SHOULDER];
-    const rs = poseLm[POSE_RIGHT_SHOULDER];
-    const visL = (ls.visibility ?? 1) > 0.35;
-    const visR = (rs.visibility ?? 1) > 0.35;
+// ── Drawing helpers ──────────────────────────────────────────────────────────
 
-    if (visL && visR) {
-      const lsX = ls.x * W, lsY = ls.y * H;
-      const rsX = rs.x * W, rsY = rs.y * H;
-      const midX = (lsX + rsX) / 2, midY = (lsY + rsY) / 2;
+function shapeSvg(shape, size = 160) {
+  const c = shape.colour;
+  const body = {
+    1: `<polygon points="50,10 92,88 8,88" fill="${c}"/>`,
+    2: `<circle cx="50" cy="50" r="42" fill="${c}"/>`,
+    3: `<rect x="10" y="10" width="80" height="80" rx="6" fill="${c}"/>`,
+    4: `<polygon points="50,6 94,50 50,94 6,50" fill="${c}"/>`,
+    5: `<polygon points="50,5 61,38 96,38 68,59 79,92 50,71 21,92 32,59 4,38 39,38" fill="${c}"/>`,
+  }[shape.id];
+  return `<svg viewBox="0 0 100 100" width="${size}" height="${size}" role="img" aria-label="${shape.name}">${body}</svg>`;
+}
 
-      const bodyColor = isTorsoSlouching ? "rgba(239, 68, 68, 0.85)" : "rgba(56, 189, 248, 0.75)";
+/** Simple hand glyph: raised fingers filled, folded fingers stubbed. */
+function handSvg(n, size = 54) {
+  const up = (i) => (n === 5 ? true : i < n);
+  let f = "";
+  for (let i = 0; i < 4; i++) {
+    const x = 20 + i * 15;
+    const h = up(i) ? 34 : 10;
+    const y = 46 - h;
+    f += `<rect x="${x}" y="${y}" width="10" height="${h + 8}" rx="5" fill="${up(i) ? "#0F172A" : "#CBD5E1"}"/>`;
+  }
+  const thumb = n === 5
+    ? `<rect x="4" y="40" width="10" height="24" rx="5" transform="rotate(-35 9 52)" fill="#0F172A"/>`
+    : `<rect x="8" y="48" width="12" height="9" rx="4.5" fill="#CBD5E1"/>`;
+  return `<svg viewBox="0 0 90 80" width="${size}" height="${size * 0.9}" role="img" aria-label="${n} fingers">
+    ${thumb}${f}<rect x="16" y="44" width="62" height="30" rx="12" fill="#0F172A"/></svg>`;
+}
 
-      ctx2d.save();
+function legendHtml(shapes) {
+  return shapes.map((s) => `
+    <div class="legend-item">
+      <span class="legend-shape">${shapeSvg(s, 34)}</span>
+      <span class="legend-num mono">${s.n}</span>
+      <span class="legend-hand">${handSvg(s.n, 40)}</span>
+      <span class="legend-name">${s.name}</span>
+    </div>`).join("");
+}
 
-      // Shoulder horizontal connector
-      ctx2d.beginPath();
-      ctx2d.moveTo(lsX, lsY);
-      ctx2d.lineTo(rsX, rsY);
-      ctx2d.strokeStyle = bodyColor;
-      ctx2d.lineWidth = 2.5;
-      ctx2d.stroke();
+// ── Application ──────────────────────────────────────────────────────────────
 
-      // Spinal / neck alignment axis to chin
-      const headAnchor = faceLm ? faceLm[CHIN] : poseLm[POSE_NOSE];
-      if (headAnchor) {
-        ctx2d.beginPath();
-        ctx2d.moveTo(midX, midY);
-        ctx2d.lineTo(headAnchor.x * W, headAnchor.y * H);
-        ctx2d.strokeStyle = bodyColor;
-        ctx2d.setLineDash([4, 4]);
-        ctx2d.lineWidth = 1.5;
-        ctx2d.stroke();
-        ctx2d.setLineDash([]);
+class App {
+  constructor() {
+    this.store = loadStore();
+    this.vision = new Vision();
+    this.video = $("#webcam");
+    this.overlay = $("#overlay");
+    this.octx = this.overlay.getContext("2d");
+    this.screen = "welcome";
+    this.frameHandler = null;   // set by whichever block is running
+    this.lastFrameT = null;
+    this.signals = { frames: 0, facePresent: 0, looking: 0, frameIntervals: [], earSamples: [], marSamples: [], occluded: 0 };
+    this.session = null;
+    this.shapes = shuffleShapes();
+    this.lastResult = null;
+  }
+
+  // ── Boot ───────────────────────────────────────────────────────────────────
+  async boot() {
+    this.wireUi();
+    this.renderSteps();
+    this.go("welcome");
+    setInterval(() => {
+      $("#utc").textContent = new Date().toISOString().slice(11, 19) + "Z";
+    }, 1000);
+
+    try {
+      $("#boot-msg").textContent = "Requesting camera access…";
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 60 } },
+        audio: false,
+      });
+      this.video.srcObject = stream;
+      await new Promise((res) => { this.video.onloadedmetadata = res; });
+      await this.video.play();
+
+      await this.vision.load((m) => { $("#boot-msg").textContent = m; });
+      $("#boot").classList.add("hidden");
+      requestAnimationFrame(() => this.loop());
+    } catch (err) {
+      $("#boot-msg").innerHTML =
+        `<span class="error">Could not start: ${err.message}</span><br><br>
+         Allow camera access and use a Chromium-based browser (Chrome or Edge).`;
+    }
+  }
+
+  // ── Per-frame loop ─────────────────────────────────────────────────────────
+  loop() {
+    requestAnimationFrame(() => this.loop());
+    if (!this.vision.ready || this.video.readyState < 2) return;
+
+    const now = performance.now();
+    const w = this.video.videoWidth || 1280;
+    const h = this.video.videoHeight || 720;
+    const f = this.vision.detect(this.video, now, w, h);
+    if (!f) return;
+
+    if (this.lastFrameT != null) this.signals.frameIntervals.push(now - this.lastFrameT);
+    this.lastFrameT = now;
+
+    this.drawOverlay(f);
+    this.updateCamBadge(f);
+    if (this.frameHandler) this.frameHandler(f);
+  }
+
+  drawOverlay(f) {
+    const cv = this.overlay;
+    const r = cv.getBoundingClientRect();
+    if (cv.width !== Math.round(r.width) || cv.height !== Math.round(r.height)) {
+      cv.width = Math.round(r.width);
+      cv.height = Math.round(r.height);
+    }
+    const ctx = this.octx;
+    ctx.clearRect(0, 0, cv.width, cv.height);
+    if (!f.handLm) return;
+
+    // The preview is mirrored so the pilot sees themselves naturally.
+    const px = (p) => (1 - p.x) * cv.width;
+    const py = (p) => p.y * cv.height;
+    const ok = f.sign != null;
+    ctx.strokeStyle = ok ? "rgba(14,165,233,.9)" : "rgba(217,119,6,.9)";
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.lineWidth = 2;
+    const bones = [[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],
+                   [9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+    for (const [a, b] of bones) {
+      ctx.beginPath();
+      ctx.moveTo(px(f.handLm[a]), py(f.handLm[a]));
+      ctx.lineTo(px(f.handLm[b]), py(f.handLm[b]));
+      ctx.stroke();
+    }
+    for (const p of f.handLm) {
+      ctx.beginPath();
+      ctx.arc(px(p), py(p), 2.5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  updateCamBadge(f) {
+    const dot = $("#cam-dot");
+    const label = $("#cam-label");
+    let state = "ok", text = "Tracking";
+    if (!f.face) { state = "warn"; text = "No face"; }
+    else if (f.occluded) { state = "warn"; text = "Hand covers face"; }
+    else if (!f.handLm) { state = "idle"; text = "No hand"; }
+    else if (f.sign == null) { state = "warn"; text = "Unclear sign"; }
+    else if (f.sign === REST_SIGN) { state = "ok"; text = "Rest"; }
+    else { state = "ok"; text = `Sign ${f.sign}`; }
+    dot.className = `dot ${state}`;
+    label.textContent = text;
+  }
+
+  /** Accumulate supporting signals while a scored block is running. */
+  recordSignals(f) {
+    this.signals.frames++;
+    if (f.face) {
+      this.signals.facePresent++;
+      if (f.face.looking) this.signals.looking++;
+      if (f.face.ear != null) this.signals.earSamples.push(f.face.ear);
+      if (f.face.mar != null) this.signals.marSamples.push(f.face.mar);
+    }
+    if (f.occluded) this.signals.occluded++;
+  }
+
+  // ── Screens ────────────────────────────────────────────────────────────────
+  renderSteps() {
+    $("#steps").innerHTML = STEPS.filter((s) => s !== "analysing")
+      .map((s) => `<span class="step" data-step="${s}">${STEP_LABELS[s]}</span>`).join("");
+  }
+
+  go(name) {
+    this.frameHandler = null;
+    this.screen = name;
+    document.querySelectorAll(".screen").forEach((el) => {
+      el.classList.toggle("active", el.dataset.screen === name);
+    });
+    const idx = STEPS.indexOf(name);
+    document.querySelectorAll(".step").forEach((el) => {
+      const i = STEPS.indexOf(el.dataset.step);
+      el.classList.toggle("done", i < idx);
+      el.classList.toggle("now", i === idx);
+    });
+    // Move the single camera element into this screen's slot, if it has one.
+    const slot = document.querySelector(`.screen[data-screen="${name}"] .cam-slot`);
+    const dock = $("#camera-dock");
+    if (slot) slot.appendChild(dock); else document.body.appendChild(dock);
+    dock.classList.toggle("offscreen", !slot);
+
+    if (name === "welcome") this.renderWelcome();
+    if (name === "setup") this.runSetup();
+    if (name === "practice") this.runPractice();
+    if (name === "touch") this.runTouch();
+    if (name === "gesture") this.runGesture();
+  }
+
+  renderWelcome() {
+    const base = baselineSessions(this.store).length;
+    const el = $("#baseline-status");
+    if (base < BASELINE_TARGET) {
+      el.className = "status-strip info";
+      el.innerHTML = `<strong>Baseline: ${base} of ${BASELINE_TARGET} rested sessions.</strong>
+        Results use population averages until your personal baseline is complete.`;
+    } else {
+      el.className = "status-strip ok";
+      el.innerHTML = `<strong>Baseline ready</strong> — built from ${base} rested sessions.`;
+    }
+
+    const recent = this.store.sessions.slice(-5).reverse();
+    $("#history-strip").innerHTML = recent.length
+      ? `<h3>Recent checks</h3>` + recent.map((s) => {
+          const v = s.verdict ?? "—";
+          const cls = v === VERDICT.NOT_FATIGUED ? "ok" : v === VERDICT.FATIGUED ? "bad" : "warn";
+          return `<div class="hist-row">
+            <span class="mono">${new Date(s.at).toLocaleString()}</span>
+            <span class="chip ${cls}">${verdictLabel(v)}</span>
+            <span class="mono muted">${s.touch?.medianMs ? Math.round(s.touch.medianMs) + " ms" : "—"}</span>
+          </div>`;
+        }).join("")
+      : "";
+  }
+
+  // ── Check-in ───────────────────────────────────────────────────────────────
+  wireUi() {
+    $("#btn-start").onclick = () => {
+      this.session = { at: Date.now(), checkin: null };
+      this.signals = { frames: 0, facePresent: 0, looking: 0, frameIntervals: [], earSamples: [], marSamples: [], occluded: 0 };
+      this.shapes = shuffleShapes();
+      $("#practice-legend").innerHTML = legendHtml(this.shapes);
+      $("#gesture-legend").innerHTML = legendHtml(this.shapes);
+      const enrolling = baselineSessions(this.store).length < BASELINE_TARGET;
+      $("#rested-wrap").classList.toggle("hidden", !enrolling);
+      $("#chk-rested").checked = false;
+      this.go("checkin");
+    };
+
+    for (const [id, out, unit] of [["sl-24", "out-24", "h"], ["sl-72", "out-72", "h"], ["sl-awake", "out-awake", "h"]]) {
+      const input = $("#" + id);
+      const render = () => { $("#" + out).textContent = `${input.value} ${unit}`; };
+      input.oninput = render;
+      render();
+    }
+
+    const labels = ["Fully alert", "Alert", "Mostly alert", "Neither", "A bit tired", "Very tired", "Exhausted"];
+    $("#rating-row").innerHTML = labels.map((l, i) =>
+      `<button class="rate" role="radio" aria-checked="false" data-rate="${i + 1}">
+         <span class="rate-n mono">${i + 1}</span><span class="rate-l">${l}</span></button>`).join("");
+    $("#rating-row").onclick = (e) => {
+      const b = e.target.closest(".rate");
+      if (!b) return;
+      document.querySelectorAll(".rate").forEach((x) => {
+        const on = x === b;
+        x.classList.toggle("on", on);
+        x.setAttribute("aria-checked", String(on));
+      });
+    };
+
+    $("#btn-checkin-next").onclick = () => {
+      const sel = document.querySelector(".rate.on");
+      this.session.checkin = {
+        sleep24: Number($("#sl-24").value),
+        sleep72: Number($("#sl-72").value),
+        hoursAwake: Number($("#sl-awake").value),
+        rating: sel ? Number(sel.dataset.rate) : null,
+        restedClaim: $("#chk-rested").checked,
+      };
+      this.go("setup");
+    };
+
+    document.querySelectorAll("[data-back]").forEach((b) => {
+      b.onclick = () => this.go(STEPS[Math.max(0, STEPS.indexOf(this.screen) - 1)]);
+    });
+
+    $("#btn-setup-next").onclick = () => this.go("practice");
+    $("#btn-practice-next").onclick = () => this.go("touch");
+    $("#btn-retest").onclick = () => this.go("welcome");
+    $("#btn-export").onclick = () => this.exportJson();
+
+    $("#practice-legend").innerHTML = legendHtml(this.shapes);
+    $("#gesture-legend").innerHTML = legendHtml(this.shapes);
+
+    $("#btn-demo").onclick = () => $("#demo-panel").classList.toggle("hidden");
+    $("#demo-panel").onclick = (e) => {
+      const act = e.target.closest("[data-demo]")?.dataset.demo;
+      if (!act) return;
+      if (act === "close") $("#demo-panel").classList.add("hidden");
+      if (act === "seed") { this.seedBaseline(); this.renderWelcome(); }
+      if (act === "clear") { this.store = { sessions: [] }; saveStore(this.store); this.renderWelcome(); }
+      if (act.startsWith("v-")) {
+        const v = act === "v-not" ? VERDICT.NOT_FATIGUED : act === "v-fat" ? VERDICT.FATIGUED : VERDICT.RETEST;
+        this.previewVerdict(v);
+      }
+    };
+  }
+
+  // ── Setup ──────────────────────────────────────────────────────────────────
+  runSetup() {
+    const checks = { face: false, light: false, hand: false, clear: false };
+    let stable = 0;
+    this.frameHandler = (f) => {
+      checks.face = !!f.face;
+      // A usable eye reading is the practical light test: if EAR can be
+      // computed at all, the eyes are resolved well enough.
+      checks.light = !!(f.face && f.face.ear != null);
+      checks.hand = !!f.handLm && f.handScale > 0.04;
+      checks.clear = !f.occluded;
+      for (const [k, v] of Object.entries(checks)) {
+        document.querySelector(`#setup-checks [data-check="${k}"]`)?.classList.toggle("ok", v);
+      }
+      stable = Object.values(checks).every(Boolean) ? stable + 1 : 0;
+      $("#btn-setup-next").disabled = stable < 15;
+    };
+  }
+
+  // ── Trial engine shared by practice and the gesture block ──────────────────
+  /**
+   * Runs one colour/hand-sign trial and resolves with its record.
+   * Phases: wait for a settled fist → random delay → stimulus → answer.
+   */
+  gestureTrial(shape, { onPhase, record = false }) {
+    return new Promise((resolve) => {
+      let phase = "rest";
+      let restFrames = 0, stimulusAt = 0, onsetAt = null, isiUntil = 0;
+      let lastSign = null, sameFor = 0, seen = 0, handFrames = 0;
+
+      onPhase("rest");
+      this.frameHandler = (f) => {
+        const now = f.t;
+        if (record) this.recordSignals(f);
+        if (phase !== "rest") { seen++; if (f.handLm) handFrames++; }
+
+        if (phase === "rest") {
+          restFrames = f.sign === REST_SIGN ? restFrames + 1 : 0;
+          if (restFrames >= STABLE_FRAMES) {
+            phase = "isi";
+            isiUntil = now + rand(...GESTURE_ISI);
+            onPhase("ready");
+          }
+          return;
+        }
+
+        if (phase === "isi") {
+          if (now >= isiUntil) {
+            phase = "stimulus";
+            stimulusAt = now;
+            onPhase("stimulus");
+          }
+          return;
+        }
+
+        if (phase !== "stimulus") return;
+
+        // Movement onset: the first frame the hand leaves the fist. Closer to
+        // decision time than the confirmed sign, which also includes the time
+        // taken to form the shape.
+        if (onsetAt == null && f.sign != null && f.sign !== REST_SIGN) onsetAt = now;
+
+        if (f.sign != null && f.sign !== REST_SIGN) {
+          sameFor = f.sign === lastSign ? sameFor + 1 : 1;
+          lastSign = f.sign;
+          if (sameFor >= STABLE_FRAMES) {
+            phase = "done";
+            this.frameHandler = null;
+            resolve({
+              shape: shape.n, answer: f.sign, correct: f.sign === shape.n,
+              rt: now - stimulusAt,
+              onsetRt: onsetAt != null ? onsetAt - stimulusAt : null,
+              rejected: false, falseStart: false,
+            });
+          }
+        } else {
+          sameFor = 0;
+          lastSign = null;
+        }
+
+        if (now - stimulusAt > GESTURE_TIMEOUT_MS) {
+          phase = "done";
+          this.frameHandler = null;
+          // Lost tracking is a rejected trial, not a pilot error: scoring a
+          // flaky tracker as a wrong answer would make the pilot look impaired.
+          const lostTracking = seen > 0 && handFrames / seen < 0.4;
+          resolve({
+            shape: shape.n, answer: null, correct: false, rt: null, onsetRt: null,
+            rejected: lostTracking, falseStart: false,
+          });
+        }
+      };
+    });
+  }
+
+  async runPractice() {
+    $("#btn-practice-next").disabled = true;
+    const stim = $("#practice-stimulus");
+    const prompt = $("#practice-prompt");
+    const fb = $("#practice-feedback");
+
+    for (let i = 0; i < PRACTICE_TRIALS; i++) {
+      const shape = this.shapes[Math.floor(Math.random() * this.shapes.length)];
+      const t = await this.gestureTrial(shape, {
+        onPhase: (p) => {
+          if (p === "rest") { stim.innerHTML = ""; prompt.textContent = "Make a fist to begin."; }
+          if (p === "ready") { stim.innerHTML = ""; prompt.textContent = "Wait…"; }
+          if (p === "stimulus") { stim.innerHTML = shapeSvg(shape); prompt.textContent = "Show the number."; }
+        },
+      });
+      if (this.screen !== "practice") return;
+      fb.textContent = t.rejected ? "Hand not seen — keep it in view."
+        : t.rt == null ? "No answer in time."
+        : t.correct ? `Good — ${Math.round(t.rt)} ms`
+        : `That was ${t.answer}, the shape needed ${t.shape}.`;
+      fb.className = `feedback ${t.correct ? "good" : "bad"}`;
+    }
+    stim.innerHTML = "";
+    prompt.textContent = "Practice complete.";
+    $("#btn-practice-next").disabled = false;
+  }
+
+  // ── Touch block ────────────────────────────────────────────────────────────
+  runTouch() {
+    const trials = [];
+    const area = $("#touch-area");
+    const dot = $("#touch-dot");
+    const msg = $("#touch-msg");
+    const start = performance.now();
+    let shownAt = null, nextAt = start + rand(...TOUCH_ISI), finished = false;
+
+    const show = () => {
+      const rect = area.getBoundingClientRect();
+      const pad = 10, size = 150;
+      dot.style.left = `${pad + Math.random() * (rect.width - size - 2 * pad)}px`;
+      dot.style.top = `${pad + Math.random() * (rect.height - size - 2 * pad)}px`;
+      dot.classList.remove("hidden");
+      msg.textContent = "";
+      requestAnimationFrame(() => { shownAt = performance.now(); });
+    };
+    const hide = () => { shownAt = null; dot.classList.add("hidden"); };
+
+    const onTap = (e) => {
+      e.preventDefault();
+      if (finished) return;
+      // event.timeStamp shares the performance.now() timebase in modern
+      // browsers, so it is closer to the real touch than the handler's own clock.
+      const now = Number.isFinite(e.timeStamp) && e.timeStamp > 0 ? e.timeStamp : performance.now();
+      if (shownAt == null) {
+        trials.push({ rt: null, falseStart: true, rejected: false, correct: true });
+        msg.textContent = "Too early — wait for the circle.";
+        nextAt = performance.now() + rand(...TOUCH_ISI);
+        return;
+      }
+      const rt = now - shownAt;
+      trials.push({ rt, falseStart: false, rejected: false, correct: true });
+      $("#touch-last").textContent = `${Math.round(rt)} ms`;
+      hide();
+      msg.textContent = "";
+      nextAt = performance.now() + rand(...TOUCH_ISI);
+    };
+    area.addEventListener("pointerdown", onTap);
+
+    // Supporting camera signals ride along with the vision loop, but the block
+    // itself is driven by its own animation frame so that slow vision
+    // processing cannot stretch the intervals or delay the stimulus.
+    this.frameHandler = (f) => this.recordSignals(f);
+
+    const tick = () => {
+      if (finished || this.screen !== "touch") return;
+      requestAnimationFrame(tick);
+      const now = performance.now();
+      const elapsed = now - start;
+      $("#touch-progress").style.width = `${Math.min(100, (elapsed / TOUCH_MS) * 100)}%`;
+      const left = Math.max(0, Math.ceil((TOUCH_MS - elapsed) / 1000));
+      $("#touch-timer").textContent = `0:${String(left).padStart(2, "0")}`;
+
+      if (shownAt == null && now >= nextAt) show();
+      if (shownAt != null && now - shownAt > TOUCH_TIMEOUT_MS) {
+        trials.push({ rt: null, falseStart: false, rejected: false, correct: true });
+        hide();
+        nextAt = now + rand(...TOUCH_ISI);
       }
 
-      // Tactical diamond markers on shoulder joints
-      drawTacticalDiamond(lsX, lsY, bodyColor);
-      drawTacticalDiamond(rsX, rsY, bodyColor);
-
-      // Clavicle center node
-      ctx2d.beginPath();
-      ctx2d.arc(midX, midY, 3.5, 0, 2 * Math.PI);
-      ctx2d.fillStyle = bodyColor;
-      ctx2d.fill();
-
-      ctx2d.restore();
-    }
+      if (elapsed >= TOUCH_MS) {
+        finished = true;
+        area.removeEventListener("pointerdown", onTap);
+        hide();
+        this.frameHandler = null;
+        this.session.touchTrials = trials;
+        this.go("gesture");
+      }
+    };
+    requestAnimationFrame(tick);
   }
 
-  // 2. Subtle Sky-Blue Facial Mesh Tesselation
-  if (faceLm) {
-    ctx2d.strokeStyle = "#1D6FA422";
-    ctx2d.lineWidth   = 0.5;
-    for (const c of (FL?.FACE_LANDMARKS_TESSELATION ?? [])) {
-      const p1 = faceLm[c.start], p2 = faceLm[c.end];
-      ctx2d.beginPath();
-      ctx2d.moveTo(p1.x * W, p1.y * H);
-      ctx2d.lineTo(p2.x * W, p2.y * H);
-      ctx2d.stroke();
-    }
+  // ── Gesture block ──────────────────────────────────────────────────────────
+  async runGesture() {
+    const trials = [];
+    const stim = $("#gesture-stimulus");
+    const prompt = $("#gesture-prompt");
+    // A fixed order of five shapes repeated in shuffled batches keeps each
+    // answer equally frequent, so the pilot cannot gain by guessing.
+    const bag = [];
+    for (let i = 0; i < GESTURE_TRIALS; i++) {
+      if (!bag.length) bag.push(...this.shapes.slice().sort(() => Math.random() - 0.5));
+      const shape = bag.pop();
+      $("#gesture-trial").textContent = `Trial ${i + 1} / ${GESTURE_TRIALS}`;
+      $("#gesture-progress").style.width = `${(i / GESTURE_TRIALS) * 100}%`;
 
-    // Eyes — color by state
-    const lColor = leftEyeClosed  ? "#F87171" : "#38BDF8";
-    const rColor = rightEyeClosed ? "#F87171" : "#7DD3FC";
-    drawContour(faceLm, FL?.FACE_LANDMARKS_LEFT_EYE,  lColor, 2);
-    drawContour(faceLm, FL?.FACE_LANDMARKS_RIGHT_EYE, rColor, 2);
-
-    // Lips — amber
-    drawContour(faceLm, FL?.FACE_LANDMARKS_LIPS, "#FBBF2488", 1.5);
-  }
-}
-
-function drawTacticalDiamond(x, y, color) {
-  const s = 6;
-  ctx2d.beginPath();
-  ctx2d.moveTo(x, y - s);
-  ctx2d.lineTo(x + s, y);
-  ctx2d.lineTo(x, y + s);
-  ctx2d.lineTo(x - s, y);
-  ctx2d.closePath();
-  ctx2d.strokeStyle = color;
-  ctx2d.lineWidth = 1.5;
-  ctx2d.fillStyle = "rgba(14, 165, 233, 0.25)";
-  ctx2d.fill();
-  ctx2d.stroke();
-}
-
-function drawContour(lm, connections, color, width) {
-  if (!connections) return;
-  ctx2d.strokeStyle = color;
-  ctx2d.lineWidth   = width;
-  for (const c of connections) {
-    const p1 = lm[c.start], p2 = lm[c.end];
-    ctx2d.beginPath();
-    ctx2d.moveTo(p1.x * canvas.width, p1.y * canvas.height);
-    ctx2d.lineTo(p2.x * canvas.width, p2.y * canvas.height);
-    ctx2d.stroke();
-  }
-}
-
-// ── Reset All System States ───────────────────────────────────────────────────
-function resetAll() {
-  sessionActive   = false;
-  sessionEnding   = false;
-  alertnessScore  = 100;
-  isCalibrating   = false;
-  calibFrames     = [];
-
-  totalEvents = totalYawns = totalLongBlinks = totalHeadDrops = totalSlouches = totalYawDrifts = 0;
-  eventHistory = [];
-
-  isBlinking = longBlinkFired = false;
-  isYawning  = yawnFired      = false;
-  asymFired  = false;
-  leftEyeClosed = rightEyeClosed = false;
-
-  badHeadPoseStart = null;
-  badYawStart      = null;
-  badTorsoStart    = null;
-  isHeadNodding    = isHeadSlumping = isYawDrifting = isTorsoSlouching = false;
-
-  lastPenaltyAt.longBlink = lastPenaltyAt.yawn =
-  lastPenaltyAt.headDrop  = lastPenaltyAt.asymmetry =
-  lastPenaltyAt.slouch    = lastPenaltyAt.yawDrift = 0;
-
-  smoothL_EAR         = null;
-  smoothR_EAR         = null;
-  smoothMAR           = null;
-  smoothPitchRatio    = null;
-  smoothYawDeg        = null;
-  smoothTiltDeg       = null;
-  smoothNoseY         = null;
-  smoothSpineRatio    = null;
-  smoothShoulderTilt  = null;
-  perclosHistory      = [];
-  perclosSum          = 0;
-  lastScoreUpdateTime = performance.now();
-
-  lEH.fill(0.28); rEH.fill(0.28); mH.fill(0); sH.fill(0);
-
-  clearInterval(sessionInterval);
-  sessionTimeEl.textContent = "00:00";
-  scanLine.classList.add("hidden");
-  alertBanner.classList.add("hidden");
-
-  [longBlinkCountR, yawnCountR, headDropCountR, eventCount].forEach(e => {
-    if (e) e.textContent = "0";
-  });
-  [leftEarVal, rightEarVal, marVal, perclosVal, postureVal].forEach(e => {
-    if (e) e.textContent = "---";
-  });
-
-  fpsBadge.textContent = "-- FPS";
-  eventLog.innerHTML   = '<li class="log-empty">No events recorded yet.</li>';
-  eventCountBadge.textContent = "0 events";
-
-  scoreNumber.textContent = "--";
-  scoreNumber.style.color = "#64748B";
-  scoreLabel.textContent  = "AWAITING START";
-  scoreLabel.style.color  = "#64748B";
-  statusPill.className    = "pill idle";
-  if (statusText) statusText.textContent = "AWAITING EVALUATION";
-  drawGauge(0);
-
-  setIndicator(indLeftEye,  "", "NORMAL");
-  setIndicator(indRightEye, "", "NORMAL");
-  setIndicator(indMouth,    "", "CLOSED");
-  setIndicator(indHeadPose, "", "LEVEL");
-  setIndicator(indTorso,    "", "UPRIGHT");
-
-  if (stLear)    stLear.textContent    = "Calibrating";
-  if (stRear)    stRear.textContent    = "Calibrating";
-  if (stMar)     stMar.textContent     = "Neutral";
-  if (stPerclos) stPerclos.textContent = "Optimal";
-  if (stPosture) stPosture.textContent = "Upright";
-
-  telChart.data.datasets[0].data = [...lEH];
-  telChart.data.datasets[1].data = [...rEH];
-  telChart.data.datasets[2].data = [...mH];
-  telChart.data.datasets[3].data = [...sH];
-  telChart.update("none");
-
-  btnStart.innerHTML = `
-    <svg class="btn-svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
-      <polygon points="5 3 19 12 5 21 5 3"/>
-    </svg>
-    <span>BEGIN EVALUATION</span>`;
-  btnStart.classList.remove("btn-danger");
-  btnStart.classList.add("btn-primary");
-  btnStart.disabled = !systemReady;
-}
-
-// ── JSON Telemetry Export ─────────────────────────────────────────────────────
-function exportJSON() {
-  const blob = new Blob([JSON.stringify({
-    system: "AeroVigil Fatigue Evaluator",
-    version: "2.1-PostureEnhanced",
-    exportedAt: new Date().toISOString(),
-    baselines: {
-      leftEAR: baselineLeftEAR,
-      rightEAR: baselineRightEAR,
-      ear: baselineEAR,
-      mar: baselineMAR,
-      pitchRatio: baselinePitchRatio,
-      yawDeg: baselineYawDeg,
-      lateralTiltDeg: baselineTilt,
-      noseY: baselineNoseY,
-      faceWidth: baselineFaceWidth,
-      shoulderTiltDeg: baselineShoulderTilt,
-      spineRatio: baselineSpineRatio,
-      upperBodyCalibrated: hasUpperBodyBaseline
-    },
-    sessionSummary: {
-      duration: sessionTimeEl.textContent,
-      finalScore: Math.floor(alertnessScore),
-      verdict: resultVerdict.textContent,
-      totalEvents,
-      totalYawns,
-      totalLongBlinks,
-      totalHeadDrops,
-      totalTorsoSlouches: totalSlouches,
-      totalYawDrifts,
-      finalPerclos: perclosVal.textContent
-    },
-    events: eventHistory
-  }, null, 2)], { type: "application/json" });
-
-  const a = Object.assign(document.createElement("a"), {
-    href: URL.createObjectURL(blob),
-    download: `aerovigil_session_${Date.now()}.json`
-  });
-  a.click();
-  URL.revokeObjectURL(a.href);
-}
-
-// ── Application Initialization ────────────────────────────────────────────────
-async function init() {
-  drawGauge(0);
-  btnStart.disabled = true;
-
-  try {
-    loadingMsg.textContent = "Requesting cockpit camera access…";
-    const stream = await navigator.mediaDevices.getUserMedia({
-      video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
-      audio: false
-    });
-    video.srcObject = stream;
-    await new Promise(res => { video.onloadedmetadata = res; });
-    video.play();
-
-    loadingMsg.textContent = "Loading AI models (cached after first run)…";
-    const { FaceLandmarker: FL, PoseLandmarker: PL, FilesetResolver } =
-      await import(`${MP_CDN}/vision_bundle.mjs`);
-    window.FaceLandmarker = FL;
-    window.PoseLandmarker = PL;
-
-    const vision = await FilesetResolver.forVisionTasks(`${MP_CDN}/wasm`);
-
-    // 1. Core Biometric Model (Face Landmarker)
-    faceLandmarker = await FL.createFromOptions(vision, {
-      baseOptions: {
-        modelAssetPath:
-          "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
-        delegate: "GPU"
-      },
-      outputFaceBlendshapes: false,
-      runningMode: "VIDEO",
-      numFaces: 1
-    });
-
-    // 2. Upper-Body Posture Model (Pose Landmarker Lite)
-    try {
-      poseLandmarker = await PL.createFromOptions(vision, {
-        baseOptions: {
-          modelAssetPath:
-            "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task",
-          delegate: "GPU"
+      const t = await this.gestureTrial(shape, {
+        record: true,
+        onPhase: (p) => {
+          if (p === "rest") { stim.innerHTML = ""; prompt.textContent = "Return to a fist."; }
+          if (p === "ready") { stim.innerHTML = ""; prompt.textContent = "Wait…"; }
+          if (p === "stimulus") { stim.innerHTML = shapeSvg(shape); prompt.textContent = ""; }
         },
-        runningMode: "VIDEO",
-        numPoses: 1
       });
-      poseLandmarkerReady = true;
-      console.log("Upper-body Pose Landmarker initialized successfully.");
-    } catch (poseErr) {
-      console.warn("PoseLandmarker optional load note (running in 3D face mode):", poseErr);
-      poseLandmarkerReady = false;
+      if (this.screen !== "gesture") return;
+      trials.push(t);
     }
+    stim.innerHTML = "";
+    this.session.gestureTrials = trials;
+    this.finish();
+  }
 
-    requestAnimationFrame(predictWebcam);
-    systemReady = true;
-    loadingOverlay.classList.add("hidden");
-    calibModal.classList.remove("hidden");
-    btnStart.disabled = false;
+  // ── Scoring and result ─────────────────────────────────────────────────────
+  finish() {
+    this.go("analysing");
+    setTimeout(() => this.score(), 1100);
+  }
 
-  } catch (err) {
-    console.error(err);
-    loadingMsg.innerHTML =
-      `<span style="color:#F87171">ERROR: ${err.message}</span><br><br>
-       Please allow camera access and use Google Chrome or Microsoft Edge.`;
+  score() {
+    const touch = blockStats(this.session.touchTrials ?? [], { lapseMs: TOUCH_LAPSE_MS });
+    const gesture = blockStats(this.session.gestureTrials ?? []);
+    const signals = qualityFromSignals(this.signals);
+    const quality = dataQuality({ touch, gesture, signals });
+    const drowsiness = drowsinessScore(this.signals);
+
+    const base = baselineSessions(this.store);
+    const { impairment, parts, usingPopulationNorms } = compareToBaseline({ touch, gesture }, base);
+    const decision = decideVerdict({ impairment, quality, baselineCount: base.length, drowsiness });
+    const mismatch = selfReportMismatch(this.session.checkin, impairment);
+
+    const record = {
+      at: this.session.at,
+      checkin: this.session.checkin,
+      touch, gesture, signals, drowsiness,
+      impairment,
+      verdict: decision.verdict,
+      reason: decision.reason,
+      mismatch,
+      baseline: quality.ok && !!this.session.checkin?.restedClaim,
+    };
+    this.store.sessions.push(record);
+    saveStore(this.store);
+
+    this.lastResult = { record, parts, quality, decision, baselineCount: base.length, usingPopulationNorms };
+    this.renderResult(this.lastResult);
+    this.go("result");
+  }
+
+  renderResult({ record, parts, quality, decision, baselineCount, usingPopulationNorms }) {
+    const v = decision.verdict;
+    const cls = v === VERDICT.NOT_FATIGUED ? "ok" : v === VERDICT.FATIGUED ? "bad" : "warn";
+    $("#verdict-card").className = `verdict ${cls}`;
+    const prov = decision.provisional ? " (Provisional)" : "";
+    $("#verdict-title").textContent = verdictLabel(v) + prov;
+    $("#verdict-line").textContent = capitalise(decision.reason ?? "");
+
+    const actions = {
+      [VERDICT.NOT_FATIGUED]: [],
+      [VERDICT.FATIGUED]: ["Rest before you fly, and retest after a break.", "Tell your supervisor.",
+        "This is an indicator, not a decision — your own assessment still applies."],
+      [VERDICT.RETEST]: decision.baselineBuilding
+        ? ["Keep doing checks when you are rested until the baseline is complete."]
+        : ["Fix the problem above and run the check again."],
+    }[v] ?? [];
+    $("#verdict-actions").innerHTML = actions.length
+      ? `<ul>${actions.map((a) => `<li>${a}</li>`).join("")}</ul>` : "";
+
+    // Today vs baseline, one bar per metric, as a z-score away from the pilot's own mean.
+    const basisNote = usingPopulationNorms
+      ? `<p class="fine">Compared against population averages (${baselineCount} of ${BASELINE_TARGET} personal baseline sessions recorded). Accuracy improves as your personal baseline grows.</p>`
+      : `<p class="fine">Bars show how far today sits from your own rested average. 0 is typical for you; right is slower.</p>`;
+    $("#bars").innerHTML = parts.length
+      ? parts.map((p) => {
+          const z = Math.max(-3, Math.min(3, p.z));
+          const half = (Math.abs(z) / 3) * 50;
+          const left = z >= 0 ? 50 : 50 - half;
+          const tone = p.z >= 2 ? "bad" : p.z >= 1 ? "warn" : "ok";
+          return `<div class="bar-row">
+            <span class="bar-label">${p.label}</span>
+            <span class="bar-track"><span class="bar-mid"></span>
+              <span class="bar-fill ${tone}" style="left:${left}%;width:${half}%"></span></span>
+            <span class="bar-z mono">${fmtZ(p.z)}</span>
+          </div>`;
+        }).join("") + basisNote
+      : `<p class="muted">No comparison data available.</p>`;
+
+    const t = record.touch, g = record.gesture;
+    $("#result-facts").innerHTML = facts([
+      ["Touch median", t.medianMs ? `${Math.round(t.medianMs)} ms` : "—"],
+      ["Touch lapses", `${t.lapses ?? "—"} of ${t.scored}`],
+      ["Early taps", String(t.falseStarts)],
+      ["Hand-sign median", g.medianMs ? `${Math.round(g.medianMs)} ms` : "—"],
+      ["Hand-sign accuracy", g.accuracy != null ? `${Math.round(g.accuracy * 100)}%` : "—"],
+      ["Trials rejected", `${g.rejected} of ${g.trials}`],
+      ["Data quality", quality.ok ? "Usable" : "Not usable"],
+    ]);
+
+    const c = record.checkin ?? {};
+    const d = record.drowsiness ?? { score: 0, perclos: null, yawns: 0, meanEar: null, details: [] };
+    $("#result-extra").innerHTML = facts([
+      ["Face present", pct(record.signals.facePresentPct)],
+      ["Looking at screen", pct(record.signals.lookingPct)],
+      ["PERCLOS", d.perclos != null ? pct(d.perclos) : "—"],
+      ["Mean eye opening (EAR)", d.meanEar != null ? d.meanEar.toFixed(3) : "—"],
+      ["Yawns detected", String(d.yawns)],
+      ["Drowsiness adjustment", d.score > 0 ? `+${(d.score * 0.3).toFixed(2)} (${d.details.join(", ")})` : "none"],
+      ["Frame jitter", record.signals.frameJitterMs ? `${record.signals.frameJitterMs.toFixed(1)} ms` : "—"],
+      ["Reported sleep (24 h)", c.sleep24 != null ? `${c.sleep24} h` : "—"],
+      ["Reported hours awake", c.hoursAwake != null ? `${c.hoursAwake} h` : "—"],
+      ["Self-rating", c.rating != null ? `${c.rating} of 7` : "—"],
+      ["Self-report mismatch", record.mismatch ?? "none"],
+      ["Counted toward baseline", record.baseline ? "yes" : "no"],
+    ]);
+  }
+
+  previewVerdict(v) {
+    $("#demo-panel").classList.add("hidden");
+    const demoTrials = (n, ms) => Array.from({ length: n }, () => ({
+      rt: ms + Math.random() * 60, falseStart: false, rejected: false, correct: true,
+    }));
+    const slow = v === VERDICT.FATIGUED;
+    const touch = blockStats(demoTrials(22, slow ? 430 : 270), { lapseMs: TOUCH_LAPSE_MS });
+    const gesture = blockStats(demoTrials(30, slow ? 1150 : 760));
+    const signals = qualityFromSignals({ frames: 1800, facePresent: 1760, looking: 1690, frameIntervals: [16, 17, 16, 17] });
+    const base = baselineSessions(this.store);
+    const { impairment, parts, usingPopulationNorms } = compareToBaseline({ touch, gesture }, base);
+    const quality = v === VERDICT.RETEST
+      ? { ok: false, reasons: ["hand tracking was lost too often"] }
+      : { ok: true, reasons: [] };
+    const drowsiness = { score: 0, perclos: null, yawns: 0, meanEar: null, details: [] };
+    const decision = v === VERDICT.RETEST
+      ? { verdict: VERDICT.RETEST, reason: quality.reasons[0], reasons: quality.reasons }
+      : { verdict: v, reason: v === VERDICT.FATIGUED ? "performance clearly below your normal range"
+                                                     : "performance within your normal range",
+          provisional: base.length < BASELINE_TARGET };
+    this.lastResult = {
+      record: { at: Date.now(), checkin: { sleep24: slow ? 4 : 7.5, hoursAwake: slow ? 17 : 2, rating: slow ? 6 : 2 },
+                touch, gesture, signals, drowsiness, impairment, verdict: decision.verdict, mismatch: null,
+                baseline: false, demo: true },
+      parts, quality, decision, baselineCount: base.length, usingPopulationNorms,
+    };
+    this.renderResult(this.lastResult);
+    this.go("result");
+  }
+
+  seedBaseline() {
+    // Synthetic sessions so the result screen can be demonstrated before any
+    // real baseline exists. Marked demo:true so exports never pass as real data.
+    const mk = (daysAgo) => {
+      // Each session gets its own offset as well as per-trial noise: real people
+      // vary between sessions, and a baseline without that variation would make
+      // every later session look impaired.
+      const dayT = (Math.random() - 0.5) * 40;
+      const dayG = (Math.random() - 0.5) * 120;
+      const t = Array.from({ length: 24 }, () => ({ rt: 255 + dayT + Math.random() * 80, falseStart: false, rejected: false, correct: true }));
+      const g = Array.from({ length: 32 }, () => ({ rt: 720 + dayG + Math.random() * 200, falseStart: false, rejected: false, correct: Math.random() > 0.05 }));
+      return {
+        at: Date.now() - daysAgo * 86_400_000,
+        demo: true, baseline: true, familiarisation: false, verdict: VERDICT.NOT_FATIGUED,
+        touch: blockStats(t, { lapseMs: TOUCH_LAPSE_MS }), gesture: blockStats(g),
+        signals: qualityFromSignals({ frames: 1800, facePresent: 1780, looking: 1700, frameIntervals: [16, 17] }),
+        checkin: { restedClaim: true, rating: 2 },
+      };
+    };
+    for (let i = 0; i < BASELINE_TARGET; i++) this.store.sessions.push(mk(BASELINE_TARGET - i));
+    saveStore(this.store);
+  }
+
+  exportJson() {
+    if (!this.lastResult) return;
+    const { record, decision } = this.lastResult;
+    const payload = {
+      system: "AeroVigil Pre-Flight Check",
+      version: "3.1-prototype",
+      note: "Advisory alertness/performance indicator. Thresholds provisional and not validated.",
+      exportedAt: new Date().toISOString(),
+      demo: !!record.demo,
+      verdict: decision.verdict,
+      provisional: !!decision.provisional,
+      reason: decision.reason,
+      impairment: record.impairment,
+      touch: record.touch,
+      gesture: record.gesture,
+      signals: record.signals,
+      drowsiness: record.drowsiness,
+      checkin: record.checkin,
+      selfReportMismatch: record.mismatch,
+      countedTowardBaseline: record.baseline,
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const a = Object.assign(document.createElement("a"), {
+      href: URL.createObjectURL(blob),
+      download: `aerovigil_check_${new Date(record.at).toISOString().slice(0, 19).replace(/[:T]/g, "")}.json`,
+    });
+    a.click();
+    URL.revokeObjectURL(a.href);
   }
 }
 
-// ── User Event Wiring ─────────────────────────────────────────────────────────
-btnStart.addEventListener("click", () => {
-  if (!systemReady) return;
-  if (sessionActive) {
-    endSession(false);
-  } else {
-    resetAll();
-    calibModal.classList.remove("hidden");
-    btnStart.disabled = true;
-  }
-});
+// ── Small formatting helpers ─────────────────────────────────────────────────
+const verdictLabel = (v) => ({
+  [VERDICT.NOT_FATIGUED]: "NOT FATIGUED",
+  [VERDICT.FATIGUED]: "FATIGUED",
+  [VERDICT.RETEST]: "RETEST NEEDED",
+}[v] ?? "—");
 
-btnBeginCalib.addEventListener("click", startCalibration);
-btnReset.addEventListener("click",      () => { resultModal.classList.add("hidden"); resetAll(); });
-btnExport.addEventListener("click",     exportJSON);
-btnResultExport.addEventListener("click", exportJSON);
-btnResultRestart.addEventListener("click", () => {
-  resultModal.classList.add("hidden");
-  resetAll();
-  calibModal.classList.remove("hidden");
-  btnStart.disabled = true;
-});
+const capitalise = (s) => (s ? s[0].toUpperCase() + s.slice(1) : "");
+// Beyond 3 the exact figure is meaningless — the baseline spread is estimated
+// from a handful of sessions — so show it as off the scale rather than "+22".
+const fmtZ = (z) => (Math.abs(z) > 3 ? (z > 0 ? ">+3 SD" : "<-3 SD") : `${z > 0 ? "+" : ""}${z.toFixed(1)} SD`);
+const pct = (x) => (x == null ? "—" : `${Math.round(x * 100)}%`);
+const facts = (rows) => rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 
-// Boot AeroVigil
-init();
+const app = new App();
+// Exposed on purpose: the tablet has no convenient devtools, and the validation
+// study needs a way to inspect and export a session from the console.
+window.aerovigil = app;
+app.boot();
