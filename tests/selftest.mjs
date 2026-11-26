@@ -16,7 +16,7 @@ const load = (f) =>
   import("data:text/javascript;base64," +
     Buffer.from(readFileSync(join(here, "..", "static", f), "utf8")).toString("base64"));
 
-const { handSign, fingerStates, handCoversFace, REST_SIGN } = await load("vision.js");
+const { handSign, fingerStates, handCoversFace, mouthAspectRatio, REST_SIGN } = await load("vision.js");
 const M = await load("metrics.js");
 
 let passed = 0;
@@ -110,7 +110,7 @@ check("block stats separate rejects, false starts and lapses", () => {
     t(null, { falseStart: true }),
     t(null),
     t(999, { rejected: true }),
-  ], { lapseMs: 355 });
+  ], { lapseMs: 550 });
 
   assert.equal(s.trials, 6);
   assert.equal(s.rejected, 1);
@@ -118,7 +118,7 @@ check("block stats separate rejects, false starts and lapses", () => {
   assert.equal(s.scored, 3);
   assert.equal(s.falseStarts, 1);
   assert.equal(s.noResponse, 1);
-  assert.equal(s.lapses, 1, "only the 400 ms trial is a lapse at 355 ms");
+  assert.equal(s.lapses, 0, "no trial exceeds 550 ms lapse threshold");
   assert.equal(s.medianMs, 300);
   // Reciprocal RT in responses per second: mean of 5, 3.33 and 2.5.
   assert.ok(Math.abs(s.invRt - 3.6111) < 1e-3, `invRt was ${s.invRt}`);
@@ -139,7 +139,7 @@ check("wrong answers are excluded from the speed metrics", () => {
 });
 
 check("an empty block does not throw", () => {
-  const s = M.blockStats([], { lapseMs: 355 });
+  const s = M.blockStats([], { lapseMs: 550 });
   assert.equal(s.scored, 0);
   assert.equal(s.medianMs, null);
   assert.equal(s.invRt, null);
@@ -206,10 +206,16 @@ check("a clearly slower session scores positive", () => {
   assert.ok(impairment > 2, `impairment was ${impairment}`);
 });
 
-check("comparison with no baseline yields nothing rather than guessing", () => {
-  const { impairment, parts } = M.compareToBaseline(session(4.0, 765), []);
-  assert.equal(impairment, null);
-  assert.equal(parts.length, 0);
+check("comparison with no baseline falls back to population norms", () => {
+  const { impairment, parts, usingPopulationNorms } = M.compareToBaseline(session(4.0, 765), []);
+  assert.ok(impairment != null, "population norms should provide a comparison");
+  assert.ok(parts.length > 0, "should have metric parts from population norms");
+  assert.equal(usingPopulationNorms, true);
+});
+
+check("population norms give a reasonable score for average performance", () => {
+  const { impairment } = M.compareToBaseline(session(2.3, 950), []);
+  assert.ok(Math.abs(impairment) < 1.5, `average performance should be near zero, got ${impairment}`);
 });
 
 // ── Data quality and verdict ─────────────────────────────────────────────────
@@ -250,25 +256,46 @@ check("bad data forces a retest even when performance looks fine", () => {
   assert.match(d.reason, /camera timing/);
 });
 
-check("an incomplete baseline forces a retest, not a verdict", () => {
+check("an incomplete baseline gives a provisional verdict, not a retest", () => {
   const d = M.decideVerdict({
     impairment: 5,
     quality: { ok: true, reasons: [] },
     baselineCount: M.BASELINE_TARGET - 1,
   });
-  assert.equal(d.verdict, M.VERDICT.RETEST);
-  assert.equal(d.baselineBuilding, true);
+  assert.equal(d.verdict, M.VERDICT.FATIGUED);
+  assert.equal(d.provisional, true);
 });
 
 check("the three verdict bands behave", () => {
   const q = { ok: true, reasons: [] };
   const n = M.BASELINE_TARGET;
-  assert.equal(M.decideVerdict({ impairment: 0.2, quality: q, baselineCount: n }).verdict, M.VERDICT.NOT_FATIGUED);
-  assert.equal(M.decideVerdict({ impairment: 1.5, quality: q, baselineCount: n }).verdict, M.VERDICT.RETEST);
-  assert.equal(M.decideVerdict({ impairment: 2.4, quality: q, baselineCount: n }).verdict, M.VERDICT.FATIGUED);
-  // Exactly on a boundary must not fall through to the borderline band.
-  assert.equal(M.decideVerdict({ impairment: M.Z_CLEAR, quality: q, baselineCount: n }).verdict, M.VERDICT.NOT_FATIGUED);
-  assert.equal(M.decideVerdict({ impairment: M.Z_FATIGUED, quality: q, baselineCount: n }).verdict, M.VERDICT.FATIGUED);
+  const noDrow = { score: 0, details: [] };
+  assert.equal(M.decideVerdict({ impairment: 0.2, quality: q, baselineCount: n, drowsiness: noDrow }).verdict, M.VERDICT.NOT_FATIGUED);
+  assert.equal(M.decideVerdict({ impairment: 1.5, quality: q, baselineCount: n, drowsiness: noDrow }).verdict, M.VERDICT.RETEST);
+  assert.equal(M.decideVerdict({ impairment: 2.4, quality: q, baselineCount: n, drowsiness: noDrow }).verdict, M.VERDICT.FATIGUED);
+  assert.equal(M.decideVerdict({ impairment: M.Z_CLEAR, quality: q, baselineCount: n, drowsiness: noDrow }).verdict, M.VERDICT.NOT_FATIGUED);
+  assert.equal(M.decideVerdict({ impairment: M.Z_FATIGUED, quality: q, baselineCount: n, drowsiness: noDrow }).verdict, M.VERDICT.FATIGUED);
+});
+
+check("drowsiness signals push a borderline verdict toward fatigued", () => {
+  const q = { ok: true, reasons: [] };
+  const n = M.BASELINE_TARGET;
+  const drowsy = { score: 2.5, details: ["elevated eye closure"] };
+  // Impairment 1.5 is borderline (RETEST), but drowsiness adds 2.5*0.3 = 0.75 → 2.25 → FATIGUED
+  assert.equal(M.decideVerdict({ impairment: 1.5, quality: q, baselineCount: n, drowsiness: drowsy }).verdict, M.VERDICT.FATIGUED);
+});
+
+check("drowsiness scoring detects elevated eye closure", () => {
+  const earSamples = Array.from({ length: 100 }, (_, i) => i < 20 ? 0.15 : 0.30);
+  const d = M.drowsinessScore({ earSamples, marSamples: [] });
+  assert.ok(d.perclos > 0.1, `perclos was ${d.perclos}`);
+  assert.ok(d.score > 0, "elevated PERCLOS should produce a positive score");
+});
+
+check("drowsiness scoring counts yawns from MAR spikes", () => {
+  const marSamples = [0.3, 0.3, 0.7, 0.7, 0.3, 0.3, 0.8, 0.3];
+  const d = M.drowsinessScore({ earSamples: [0.3, 0.3], marSamples });
+  assert.equal(d.yawns, 2);
 });
 
 check("self-report mismatches are flagged both ways", () => {

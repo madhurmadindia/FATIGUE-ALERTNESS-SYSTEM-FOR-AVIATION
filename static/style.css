@@ -203,11 +203,11 @@ input[type=range] { width: 100%; height: 36px; accent-color: var(--blue); }
 .test-foot { display: flex; justify-content: space-between; font-size: .8rem; color: var(--muted); }
 
 .touch-area {
-  width: 100%; min-height: 360px; border: 1px solid var(--line); border-radius: 12px;
+  width: 100%; min-height: 50vh; border: 1px solid var(--line); border-radius: 12px;
   background: var(--sub); display: grid; place-items: center; cursor: pointer; position: relative;
 }
 .touch-dot { width: 150px; height: 150px; border-radius: 50%; background: var(--blue);
-             box-shadow: 0 8px 30px rgba(2,132,199,.35); }
+             box-shadow: 0 8px 30px rgba(2,132,199,.35); position: absolute; }
 .touch-msg { position: absolute; font-size: .92rem; font-weight: 700; color: var(--muted); }
 .feedback { min-height: 26px; font-size: .88rem; font-weight: 700; margin: 10px 0; }
 .feedback.good { color: var(--green); }

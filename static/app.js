@@ -9,7 +9,8 @@
 import { Vision, REST_SIGN } from "./vision.js";
 import {
   blockStats, qualityFromSignals, dataQuality, compareToBaseline, decideVerdict,
-  selfReportMismatch, TOUCH_LAPSE_MS, FALSE_START_MS, GESTURE_TIMEOUT_MS,
+  selfReportMismatch, drowsinessScore,
+  TOUCH_LAPSE_MS, FALSE_START_MS, GESTURE_TIMEOUT_MS,
   BASELINE_TARGET, FAMILIARISATION, VERDICT,
 } from "./metrics.js";
 
@@ -22,13 +23,22 @@ const GESTURE_ISI = [900, 2500];  // measured from the moment the fist is settle
 const PRACTICE_TRIALS = 5;
 const STABLE_FRAMES = 3;          // frames a sign must hold before it counts
 
-const SHAPES = [
-  { n: 1, name: "Triangle", colour: "#EA580C" },
-  { n: 2, name: "Circle",   colour: "#0284C7" },
-  { n: 3, name: "Square",   colour: "#059669" },
-  { n: 4, name: "Diamond",  colour: "#CA8A04" },
-  { n: 5, name: "Star",     colour: "#7C3AED" },
+const SHAPE_DEFS = [
+  { id: 1, name: "Triangle", colour: "#EA580C" },
+  { id: 2, name: "Circle",   colour: "#0284C7" },
+  { id: 3, name: "Square",   colour: "#059669" },
+  { id: 4, name: "Diamond",  colour: "#CA8A04" },
+  { id: 5, name: "Star",     colour: "#7C3AED" },
 ];
+
+function shuffleShapes() {
+  const nums = [1, 2, 3, 4, 5];
+  for (let i = nums.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [nums[i], nums[j]] = [nums[j], nums[i]];
+  }
+  return SHAPE_DEFS.map((s, i) => ({ ...s, n: nums[i] }));
+}
 
 const STEPS = ["welcome", "checkin", "setup", "practice", "touch", "gesture", "analysing", "result"];
 const STEP_LABELS = {
@@ -74,7 +84,7 @@ function shapeSvg(shape, size = 160) {
     3: `<rect x="10" y="10" width="80" height="80" rx="6" fill="${c}"/>`,
     4: `<polygon points="50,6 94,50 50,94 6,50" fill="${c}"/>`,
     5: `<polygon points="50,5 61,38 96,38 68,59 79,92 50,71 21,92 32,59 4,38 39,38" fill="${c}"/>`,
-  }[shape.n];
+  }[shape.id];
   return `<svg viewBox="0 0 100 100" width="${size}" height="${size}" role="img" aria-label="${shape.name}">${body}</svg>`;
 }
 
@@ -95,8 +105,8 @@ function handSvg(n, size = 54) {
     ${thumb}${f}<rect x="16" y="44" width="62" height="30" rx="12" fill="#0F172A"/></svg>`;
 }
 
-function legendHtml() {
-  return SHAPES.map((s) => `
+function legendHtml(shapes) {
+  return shapes.map((s) => `
     <div class="legend-item">
       <span class="legend-shape">${shapeSvg(s, 34)}</span>
       <span class="legend-num mono">${s.n}</span>
@@ -117,8 +127,9 @@ class App {
     this.screen = "welcome";
     this.frameHandler = null;   // set by whichever block is running
     this.lastFrameT = null;
-    this.signals = { frames: 0, facePresent: 0, looking: 0, frameIntervals: [], earSamples: [], occluded: 0 };
+    this.signals = { frames: 0, facePresent: 0, looking: 0, frameIntervals: [], earSamples: [], marSamples: [], occluded: 0 };
     this.session = null;
+    this.shapes = shuffleShapes();
     this.lastResult = null;
   }
 
@@ -224,6 +235,7 @@ class App {
       this.signals.facePresent++;
       if (f.face.looking) this.signals.looking++;
       if (f.face.ear != null) this.signals.earSamples.push(f.face.ear);
+      if (f.face.mar != null) this.signals.marSamples.push(f.face.mar);
     }
     if (f.occluded) this.signals.occluded++;
   }
@@ -260,17 +272,12 @@ class App {
   }
 
   renderWelcome() {
-    const done = this.store.sessions.length;
     const base = baselineSessions(this.store).length;
     const el = $("#baseline-status");
-    if (done < FAMILIARISATION) {
+    if (base < BASELINE_TARGET) {
       el.className = "status-strip info";
-      el.innerHTML = `<strong>Familiarisation.</strong> Your first ${FAMILIARISATION} sessions are practice and are
-        not used as a baseline, because people get faster at any new task for the first few goes.`;
-    } else if (base < BASELINE_TARGET) {
-      el.className = "status-strip info";
-      el.innerHTML = `<strong>Building your baseline: ${base} of ${BASELINE_TARGET} rested sessions.</strong>
-        Until it is complete the app cannot judge a session, and will say <em>Retest needed</em>.`;
+      el.innerHTML = `<strong>Baseline: ${base} of ${BASELINE_TARGET} rested sessions.</strong>
+        Results use population averages until your personal baseline is complete.`;
     } else {
       el.className = "status-strip ok";
       el.innerHTML = `<strong>Baseline ready</strong> — built from ${base} rested sessions.`;
@@ -294,11 +301,11 @@ class App {
   wireUi() {
     $("#btn-start").onclick = () => {
       this.session = { at: Date.now(), checkin: null };
-      this.signals = { frames: 0, facePresent: 0, looking: 0, frameIntervals: [], earSamples: [], occluded: 0 };
-      // The rested declaration is only asked for while the baseline is still
-      // being built; afterwards it would just be another gameable input.
-      const enrolling = baselineSessions(this.store).length < BASELINE_TARGET
-        && this.store.sessions.length >= FAMILIARISATION;
+      this.signals = { frames: 0, facePresent: 0, looking: 0, frameIntervals: [], earSamples: [], marSamples: [], occluded: 0 };
+      this.shapes = shuffleShapes();
+      $("#practice-legend").innerHTML = legendHtml(this.shapes);
+      $("#gesture-legend").innerHTML = legendHtml(this.shapes);
+      const enrolling = baselineSessions(this.store).length < BASELINE_TARGET;
       $("#rested-wrap").classList.toggle("hidden", !enrolling);
       $("#chk-rested").checked = false;
       this.go("checkin");
@@ -346,8 +353,8 @@ class App {
     $("#btn-retest").onclick = () => this.go("welcome");
     $("#btn-export").onclick = () => this.exportJson();
 
-    $("#practice-legend").innerHTML = legendHtml();
-    $("#gesture-legend").innerHTML = legendHtml();
+    $("#practice-legend").innerHTML = legendHtml(this.shapes);
+    $("#gesture-legend").innerHTML = legendHtml(this.shapes);
 
     $("#btn-demo").onclick = () => $("#demo-panel").classList.toggle("hidden");
     $("#demo-panel").onclick = (e) => {
@@ -465,7 +472,7 @@ class App {
     const fb = $("#practice-feedback");
 
     for (let i = 0; i < PRACTICE_TRIALS; i++) {
-      const shape = SHAPES[Math.floor(Math.random() * SHAPES.length)];
+      const shape = this.shapes[Math.floor(Math.random() * this.shapes.length)];
       const t = await this.gestureTrial(shape, {
         onPhase: (p) => {
           if (p === "rest") { stim.innerHTML = ""; prompt.textContent = "Make a fist to begin."; }
@@ -495,11 +502,12 @@ class App {
     let shownAt = null, nextAt = start + rand(...TOUCH_ISI), finished = false;
 
     const show = () => {
+      const rect = area.getBoundingClientRect();
+      const pad = 10, size = 150;
+      dot.style.left = `${pad + Math.random() * (rect.width - size - 2 * pad)}px`;
+      dot.style.top = `${pad + Math.random() * (rect.height - size - 2 * pad)}px`;
       dot.classList.remove("hidden");
       msg.textContent = "";
-      // Stamp the stimulus on the frame that paints it, not the frame that
-      // asked for it: this block is the precise anchor the hand-sign block is
-      // measured against, so a frame of slack here matters.
       requestAnimationFrame(() => { shownAt = performance.now(); });
     };
     const hide = () => { shownAt = null; dot.classList.add("hidden"); };
@@ -567,7 +575,7 @@ class App {
     // answer equally frequent, so the pilot cannot gain by guessing.
     const bag = [];
     for (let i = 0; i < GESTURE_TRIALS; i++) {
-      if (!bag.length) bag.push(...SHAPES.slice().sort(() => Math.random() - 0.5));
+      if (!bag.length) bag.push(...this.shapes.slice().sort(() => Math.random() - 0.5));
       const shape = bag.pop();
       $("#gesture-trial").textContent = `Trial ${i + 1} / ${GESTURE_TRIALS}`;
       $("#gesture-progress").style.width = `${(i / GESTURE_TRIALS) * 100}%`;
@@ -599,39 +607,37 @@ class App {
     const gesture = blockStats(this.session.gestureTrials ?? []);
     const signals = qualityFromSignals(this.signals);
     const quality = dataQuality({ touch, gesture, signals });
+    const drowsiness = drowsinessScore(this.signals);
 
     const base = baselineSessions(this.store);
-    const { impairment, parts } = compareToBaseline({ touch, gesture }, base);
-    const decision = decideVerdict({ impairment, quality, baselineCount: base.length });
+    const { impairment, parts, usingPopulationNorms } = compareToBaseline({ touch, gesture }, base);
+    const decision = decideVerdict({ impairment, quality, baselineCount: base.length, drowsiness });
     const mismatch = selfReportMismatch(this.session.checkin, impairment);
 
-    const isFamiliarisation = this.store.sessions.length < FAMILIARISATION;
     const record = {
       at: this.session.at,
       checkin: this.session.checkin,
-      touch, gesture, signals,
+      touch, gesture, signals, drowsiness,
       impairment,
       verdict: decision.verdict,
       reason: decision.reason,
       mismatch,
-      familiarisation: isFamiliarisation,
-      // A session only joins the baseline if the pilot declared themselves
-      // rested AND the data was clean AND it is past familiarisation.
-      baseline: !isFamiliarisation && quality.ok && !!this.session.checkin?.restedClaim,
+      baseline: quality.ok && !!this.session.checkin?.restedClaim,
     };
     this.store.sessions.push(record);
     saveStore(this.store);
 
-    this.lastResult = { record, parts, quality, decision, baselineCount: base.length };
+    this.lastResult = { record, parts, quality, decision, baselineCount: base.length, usingPopulationNorms };
     this.renderResult(this.lastResult);
     this.go("result");
   }
 
-  renderResult({ record, parts, quality, decision, baselineCount }) {
+  renderResult({ record, parts, quality, decision, baselineCount, usingPopulationNorms }) {
     const v = decision.verdict;
     const cls = v === VERDICT.NOT_FATIGUED ? "ok" : v === VERDICT.FATIGUED ? "bad" : "warn";
     $("#verdict-card").className = `verdict ${cls}`;
-    $("#verdict-title").textContent = verdictLabel(v);
+    const prov = decision.provisional ? " (Provisional)" : "";
+    $("#verdict-title").textContent = verdictLabel(v) + prov;
     $("#verdict-line").textContent = capitalise(decision.reason ?? "");
 
     const actions = {
@@ -646,10 +652,11 @@ class App {
       ? `<ul>${actions.map((a) => `<li>${a}</li>`).join("")}</ul>` : "";
 
     // Today vs baseline, one bar per metric, as a z-score away from the pilot's own mean.
+    const basisNote = usingPopulationNorms
+      ? `<p class="fine">Compared against population averages (${baselineCount} of ${BASELINE_TARGET} personal baseline sessions recorded). Accuracy improves as your personal baseline grows.</p>`
+      : `<p class="fine">Bars show how far today sits from your own rested average. 0 is typical for you; right is slower.</p>`;
     $("#bars").innerHTML = parts.length
       ? parts.map((p) => {
-          // Centre is the pilot's own average; the bar runs right when slower
-          // than usual, left when faster. Clamped at 3 standard deviations.
           const z = Math.max(-3, Math.min(3, p.z));
           const half = (Math.abs(z) / 3) * 50;
           const left = z >= 0 ? 50 : 50 - half;
@@ -660,9 +667,8 @@ class App {
               <span class="bar-fill ${tone}" style="left:${left}%;width:${half}%"></span></span>
             <span class="bar-z mono">${fmtZ(p.z)}</span>
           </div>`;
-        }).join("") + `<p class="fine">Bars show how far today sits from your own rested average, in units of
-            your own session-to-session spread. 0 is typical for you; right is slower or less accurate.</p>`
-      : `<p class="muted">No baseline comparison yet (${baselineCount} of ${BASELINE_TARGET} rested sessions).</p>`;
+        }).join("") + basisNote
+      : `<p class="muted">No comparison data available.</p>`;
 
     const t = record.touch, g = record.gesture;
     $("#result-facts").innerHTML = facts([
@@ -676,10 +682,14 @@ class App {
     ]);
 
     const c = record.checkin ?? {};
+    const d = record.drowsiness ?? { score: 0, perclos: null, yawns: 0, meanEar: null, details: [] };
     $("#result-extra").innerHTML = facts([
       ["Face present", pct(record.signals.facePresentPct)],
       ["Looking at screen", pct(record.signals.lookingPct)],
-      ["Mean frame interval", record.signals.meanFrameMs ? `${record.signals.meanFrameMs.toFixed(1)} ms` : "—"],
+      ["PERCLOS", d.perclos != null ? pct(d.perclos) : "—"],
+      ["Mean eye opening (EAR)", d.meanEar != null ? d.meanEar.toFixed(3) : "—"],
+      ["Yawns detected", String(d.yawns)],
+      ["Drowsiness adjustment", d.score > 0 ? `+${(d.score * 0.3).toFixed(2)} (${d.details.join(", ")})` : "none"],
       ["Frame jitter", record.signals.frameJitterMs ? `${record.signals.frameJitterMs.toFixed(1)} ms` : "—"],
       ["Reported sleep (24 h)", c.sleep24 != null ? `${c.sleep24} h` : "—"],
       ["Reported hours awake", c.hoursAwake != null ? `${c.hoursAwake} h` : "—"],
@@ -699,19 +709,21 @@ class App {
     const gesture = blockStats(demoTrials(30, slow ? 1150 : 760));
     const signals = qualityFromSignals({ frames: 1800, facePresent: 1760, looking: 1690, frameIntervals: [16, 17, 16, 17] });
     const base = baselineSessions(this.store);
-    const { impairment, parts } = compareToBaseline({ touch, gesture }, base);
+    const { impairment, parts, usingPopulationNorms } = compareToBaseline({ touch, gesture }, base);
     const quality = v === VERDICT.RETEST
       ? { ok: false, reasons: ["hand tracking was lost too often"] }
       : { ok: true, reasons: [] };
+    const drowsiness = { score: 0, perclos: null, yawns: 0, meanEar: null, details: [] };
     const decision = v === VERDICT.RETEST
       ? { verdict: VERDICT.RETEST, reason: quality.reasons[0], reasons: quality.reasons }
       : { verdict: v, reason: v === VERDICT.FATIGUED ? "performance clearly below your normal range"
-                                                     : "performance within your normal range" };
+                                                     : "performance within your normal range",
+          provisional: base.length < BASELINE_TARGET };
     this.lastResult = {
       record: { at: Date.now(), checkin: { sleep24: slow ? 4 : 7.5, hoursAwake: slow ? 17 : 2, rating: slow ? 6 : 2 },
-                touch, gesture, signals, impairment, verdict: decision.verdict, mismatch: null,
+                touch, gesture, signals, drowsiness, impairment, verdict: decision.verdict, mismatch: null,
                 baseline: false, demo: true },
-      parts, quality, decision, baselineCount: base.length,
+      parts, quality, decision, baselineCount: base.length, usingPopulationNorms,
     };
     this.renderResult(this.lastResult);
     this.go("result");
@@ -745,16 +757,18 @@ class App {
     const { record, decision } = this.lastResult;
     const payload = {
       system: "AeroVigil Pre-Flight Check",
-      version: "3.0-prototype",
+      version: "3.1-prototype",
       note: "Advisory alertness/performance indicator. Thresholds provisional and not validated.",
       exportedAt: new Date().toISOString(),
       demo: !!record.demo,
       verdict: decision.verdict,
+      provisional: !!decision.provisional,
       reason: decision.reason,
       impairment: record.impairment,
       touch: record.touch,
       gesture: record.gesture,
       signals: record.signals,
+      drowsiness: record.drowsiness,
       checkin: record.checkin,
       selfReportMismatch: record.mismatch,
       countedTowardBaseline: record.baseline,
@@ -779,7 +793,7 @@ const verdictLabel = (v) => ({
 const capitalise = (s) => (s ? s[0].toUpperCase() + s.slice(1) : "");
 // Beyond 3 the exact figure is meaningless — the baseline spread is estimated
 // from a handful of sessions — so show it as off the scale rather than "+22".
-const fmtZ = (z) => (Math.abs(z) > 3 ? (z > 0 ? ">+3" : "<-3") : `${z > 0 ? "+" : ""}${z.toFixed(1)}`);
+const fmtZ = (z) => (Math.abs(z) > 3 ? (z > 0 ? ">+3 SD" : "<-3 SD") : `${z > 0 ? "+" : ""}${z.toFixed(1)} SD`);
 const pct = (x) => (x == null ? "—" : `${Math.round(x * 100)}%`);
 const facts = (rows) => rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("");
 

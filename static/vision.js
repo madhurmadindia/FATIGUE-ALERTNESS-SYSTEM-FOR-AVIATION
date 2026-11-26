@@ -25,6 +25,10 @@ const FOREHEAD = 10;
 const CHIN = 152;
 const L_TRAGUS = 234;
 const R_TRAGUS = 454;
+const UPPER_LIP = 13;
+const LOWER_LIP = 14;
+const MOUTH_LEFT = 308;
+const MOUTH_RIGHT = 78;
 
 // ── Hand landmark indices ────────────────────────────────────────────────────
 const WRIST = 0;
@@ -124,6 +128,12 @@ export function pitchRatio(lm, w, h) {
   return faceW < 1e-4 ? null : faceH / faceW;
 }
 
+export function mouthAspectRatio(lm, w, h) {
+  const v = dist2D(lm[UPPER_LIP], lm[LOWER_LIP], w, h);
+  const span = dist2D(lm[MOUTH_LEFT], lm[MOUTH_RIGHT], w, h);
+  return span < 1e-4 ? null : v / span;
+}
+
 export function faceSignals(lm, w, h) {
   if (!lm) return null;
   const left = eyeAspectRatio(lm, LEFT_EYE, w, h);
@@ -133,11 +143,10 @@ export function faceSignals(lm, w, h) {
     leftEar: left,
     rightEar: right,
     ear: left != null && right != null ? (left + right) / 2 : null,
+    mar: mouthAspectRatio(lm, w, h),
     yaw,
     pitchRatio: pitchRatio(lm, w, h),
-    // Looking at the screen is judged on head direction alone. Gaze direction
-    // would need iris tracking we do not calibrate, so this is deliberately coarse.
-    looking: yaw != null && Math.abs(yaw) < 20,
+    looking: yaw != null && Math.abs(yaw) < 40,
   };
 }
 

@@ -9,9 +9,10 @@
  * project report produces real cut-offs.
  */
 
-// Touch block: PVT-B parameters (Basner, Mollicone & Dinges 2011) — ISI 1-4 s,
-// so the matching lapse threshold is 355 ms rather than the 10-minute test's 500 ms.
-export const TOUCH_LAPSE_MS = 355;
+// Touch block: adapted from PVT-B (Basner, Mollicone & Dinges 2011). The dot
+// appears at a random position, adding scan + reach time vs a fixed-button lab
+// PVT, so the lapse threshold is raised from the lab's 355 ms to 550 ms.
+export const TOUCH_LAPSE_MS = 550;
 export const FALSE_START_MS = 100;
 
 // Gesture block: no published lapse threshold exists for a colour-to-hand-sign
@@ -34,8 +35,20 @@ export const Z_CLEAR = 1.0;
 export const SD_FLOOR = { invRt: 0.2, slowestInvRt: 0.15, lapses: 1.5, medianMs: 30 };
 export const SD_FLOOR_FRACTION = 0.08;
 
-export const BASELINE_TARGET = 5;      // rested sessions needed before a verdict
-export const FAMILIARISATION = 2;      // first sessions discarded (practice effects)
+// Population norms (healthy rested adults) for a random-position dot on a tablet.
+// Touch norms are adjusted from Basner & Dinges 2011 to account for the scan +
+// reach time the random dot adds (~200 ms). Gesture norms are estimates.
+// shortcut: replace with study-derived norms once the validation data exists.
+export const POPULATION_NORMS = {
+  touchInvRt:     { mean: 2.3, sd: 0.5 },
+  touchSlowest:   { mean: 1.6, sd: 0.4 },
+  touchLapses:    { mean: 3.0, sd: 2.5 },
+  gestureMedian:  { mean: 950, sd: 200 },
+  gestureSlowest: { mean: 1.0, sd: 0.3 },
+};
+
+export const BASELINE_TARGET = 5;      // rested sessions needed before a full verdict
+export const FAMILIARISATION = 0;      // disabled for initial deployment
 
 export const VERDICT = {
   NOT_FATIGUED: "NOT_FATIGUED",
@@ -130,6 +143,39 @@ export function dataQuality({ touch, gesture, signals }) {
   return { ok: reasons.length === 0, reasons };
 }
 
+/**
+ * Drowsiness indicators from accumulated face signals.
+ * These run silently during both test blocks and contribute to the final
+ * verdict without being shown to the pilot during the test.
+ */
+export function drowsinessScore({ earSamples, marSamples }) {
+  if (!earSamples?.length) return { score: 0, perclos: null, yawns: 0, meanEar: null, details: [] };
+
+  const EAR_CLOSED = 0.21;
+  const MAR_YAWN = 0.55;
+
+  const perclos = earSamples.filter((e) => e < EAR_CLOSED).length / earSamples.length;
+  const meanEar = mean(earSamples);
+
+  let yawns = 0, inYawn = false;
+  for (const m of marSamples ?? []) {
+    if (m > MAR_YAWN && !inYawn) { yawns++; inYawn = true; }
+    if (m <= MAR_YAWN) inYawn = false;
+  }
+
+  const details = [];
+  let score = 0;
+  if (perclos > 0.08) {
+    score += Math.min((perclos - 0.08) * 15, 2);
+    details.push("elevated eye closure");
+  }
+  if (yawns >= 1) { score += 0.5; details.push(`${yawns} yawn${yawns > 1 ? "s" : ""} detected`); }
+  if (yawns >= 3) score += 0.5;
+  if (meanEar != null && meanEar < 0.22) { score += 0.5; details.push("low average eye opening"); }
+
+  return { score: Math.min(score, 3), perclos, yawns, meanEar, details };
+}
+
 /** Mean and spread of one metric across stored baseline sessions. */
 export function baselineFor(sessions, pick, floor) {
   const xs = sessions.map(pick).filter((x) => x != null && Number.isFinite(x));
@@ -157,13 +203,21 @@ export function zScore(value, base, { higherIsWorse }) {
  * is still unvalidated (see the project report).
  */
 export function compareToBaseline(today, baselineSessions) {
-  const b = {
-    touchInvRt: baselineFor(baselineSessions, (s) => s.touch.invRt, SD_FLOOR.invRt),
-    touchSlowest: baselineFor(baselineSessions, (s) => s.touch.slowestInvRt, SD_FLOOR.slowestInvRt),
-    touchLapses: baselineFor(baselineSessions, (s) => s.touch.lapses, SD_FLOOR.lapses),
-    gestureMedian: baselineFor(baselineSessions, (s) => s.gesture.medianMs, SD_FLOOR.medianMs),
-    gestureSlowest: baselineFor(baselineSessions, (s) => s.gesture.slowestInvRt, SD_FLOOR.slowestInvRt),
-  };
+  const picks = [
+    ["touchInvRt", (s) => s.touch.invRt, SD_FLOOR.invRt],
+    ["touchSlowest", (s) => s.touch.slowestInvRt, SD_FLOOR.slowestInvRt],
+    ["touchLapses", (s) => s.touch.lapses, SD_FLOOR.lapses],
+    ["gestureMedian", (s) => s.gesture.medianMs, SD_FLOOR.medianMs],
+    ["gestureSlowest", (s) => s.gesture.slowestInvRt, SD_FLOOR.slowestInvRt],
+  ];
+
+  let usingPopulationNorms = false;
+  const b = {};
+  for (const [key, pick, floor] of picks) {
+    const personal = baselineFor(baselineSessions, pick, floor);
+    if (personal) { b[key] = personal; }
+    else { b[key] = POPULATION_NORMS[key]; usingPopulationNorms = true; }
+  }
 
   const parts = [
     { key: "touchInvRt", label: "Tap speed", weight: 2, z: zScore(today.touch.invRt, b.touchInvRt, { higherIsWorse: false }) },
@@ -173,11 +227,11 @@ export function compareToBaseline(today, baselineSessions) {
     { key: "gestureSlowest", label: "Slowest hand signs", weight: 1, z: zScore(today.gesture.slowestInvRt, b.gestureSlowest, { higherIsWorse: false }) },
   ].filter((p) => p.z != null);
 
-  if (!parts.length) return { impairment: null, parts: [], baseline: b };
+  if (!parts.length) return { impairment: null, parts: [], baseline: b, usingPopulationNorms };
 
   const wsum = parts.reduce((a, p) => a + p.weight, 0);
   const impairment = parts.reduce((a, p) => a + p.z * p.weight, 0) / wsum;
-  return { impairment, parts, baseline: b };
+  return { impairment, parts, baseline: b, usingPopulationNorms };
 }
 
 /**
@@ -185,28 +239,29 @@ export function compareToBaseline(today, baselineSessions) {
  * impairment before a duty, forcing a yes/no answer on a noisy reading would
  * flag far more rested pilots than tired ones.
  */
-export function decideVerdict({ impairment, quality, baselineCount }) {
+export function decideVerdict({ impairment, quality, baselineCount, drowsiness }) {
   if (!quality.ok) {
     return { verdict: VERDICT.RETEST, reason: quality.reasons[0], reasons: quality.reasons };
-  }
-  if (baselineCount < BASELINE_TARGET) {
-    return {
-      verdict: VERDICT.RETEST,
-      reason: `baseline not ready (${baselineCount} of ${BASELINE_TARGET} rested sessions recorded)`,
-      reasons: [],
-      baselineBuilding: true,
-    };
   }
   if (impairment == null) {
     return { verdict: VERDICT.RETEST, reason: "not enough comparable data", reasons: [] };
   }
-  if (impairment >= Z_FATIGUED) {
-    return { verdict: VERDICT.FATIGUED, reason: "performance clearly below your normal range", reasons: [] };
+
+  // Drowsiness signals (PERCLOS, yawns, eye closure) adjust the impairment
+  // upward — they can make a verdict more cautious but never less.
+  let adjusted = impairment;
+  if (drowsiness && drowsiness.score > 0) {
+    adjusted = impairment + drowsiness.score * 0.3;
   }
-  if (impairment <= Z_CLEAR) {
-    return { verdict: VERDICT.NOT_FATIGUED, reason: "performance within your normal range", reasons: [] };
+
+  const provisional = baselineCount < BASELINE_TARGET;
+  if (adjusted >= Z_FATIGUED) {
+    return { verdict: VERDICT.FATIGUED, reason: "performance clearly below your normal range", reasons: [], provisional };
   }
-  return { verdict: VERDICT.RETEST, reason: "result is borderline", reasons: [] };
+  if (adjusted <= Z_CLEAR) {
+    return { verdict: VERDICT.NOT_FATIGUED, reason: "performance within your normal range", reasons: [], provisional };
+  }
+  return { verdict: VERDICT.RETEST, reason: "result is borderline", reasons: [], provisional };
 }
 
 /**
