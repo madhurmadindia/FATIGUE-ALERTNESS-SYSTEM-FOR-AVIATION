@@ -17,7 +17,7 @@ import {
 const TOUCH_MS = 60_000;          // touch block length
 const TOUCH_ISI = [1000, 4000];   // PVT-B style inter-stimulus interval
 const TOUCH_TIMEOUT_MS = 3000;
-const GESTURE_TRIALS = 36;
+const GESTURE_TRIALS = 20;
 const GESTURE_ISI = [900, 2500];  // measured from the moment the fist is settled
 const PRACTICE_TRIALS = 5;
 const STABLE_FRAMES = 3;          // frames a sign must hold before it counts
