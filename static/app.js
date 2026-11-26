@@ -126,7 +126,7 @@ class App {
   async boot() {
     this.wireUi();
     this.renderSteps();
-    this.renderWelcome();
+    this.go("welcome");
     setInterval(() => {
       $("#utc").textContent = new Date().toISOString().slice(11, 19) + "Z";
     }, 1000);
@@ -720,7 +720,7 @@ class App {
   seedBaseline() {
     // Synthetic sessions so the result screen can be demonstrated before any
     // real baseline exists. Marked demo:true so exports never pass as real data.
-    const mk = () => {
+    const mk = (daysAgo) => {
       // Each session gets its own offset as well as per-trial noise: real people
       // vary between sessions, and a baseline without that variation would make
       // every later session look impaired.
@@ -729,13 +729,14 @@ class App {
       const t = Array.from({ length: 24 }, () => ({ rt: 255 + dayT + Math.random() * 80, falseStart: false, rejected: false, correct: true }));
       const g = Array.from({ length: 32 }, () => ({ rt: 720 + dayG + Math.random() * 200, falseStart: false, rejected: false, correct: Math.random() > 0.05 }));
       return {
-        at: Date.now(), demo: true, baseline: true, familiarisation: false, verdict: VERDICT.NOT_FATIGUED,
+        at: Date.now() - daysAgo * 86_400_000,
+        demo: true, baseline: true, familiarisation: false, verdict: VERDICT.NOT_FATIGUED,
         touch: blockStats(t, { lapseMs: TOUCH_LAPSE_MS }), gesture: blockStats(g),
         signals: qualityFromSignals({ frames: 1800, facePresent: 1780, looking: 1700, frameIntervals: [16, 17] }),
         checkin: { restedClaim: true, rating: 2 },
       };
     };
-    for (let i = 0; i < BASELINE_TARGET; i++) this.store.sessions.push(mk());
+    for (let i = 0; i < BASELINE_TARGET; i++) this.store.sessions.push(mk(BASELINE_TARGET - i));
     saveStore(this.store);
   }
 
